@@ -64,6 +64,7 @@ import {
   systemTools,
   systemSkillsDir,
   type AgentConfig,
+  type AgentModelConfig,
   type ToolDefinition,
   type ModelContentBlock,
   type RunAgentResult,
@@ -839,6 +840,33 @@ async function handleCreateAgent(req: IncomingMessage, res: ServerResponse): Pro
 // why that's regenerable on its own, unlike the rest of an already-
 // imported module). No restart needed, same as every other admin edit
 // in this app.
+// model.maxTokens/model.reasoningEffort are edit-only — scaffoldAgent has
+// no use for either at creation time, so they're parsed here rather than
+// widening parseAgentTemplateOptions/AgentTemplateOptions (shared with
+// agent creation) for something only this route needs. Only ever called
+// after parseAgentTemplateOptions already validated provider/model, so
+// there's nothing to re-validate here beyond these two fields themselves.
+function parseEditModelExtras(
+  body: Record<string, unknown>,
+  model: AgentEditableFields['model'],
+): { ok: true; value: AgentEditableFields['model'] } | { ok: false; error: string } {
+  if (!model || typeof body.model !== 'object' || body.model === null) return { ok: true, value: model }
+  const rawModel = body.model as Record<string, unknown>
+  if (rawModel.maxTokens !== undefined && rawModel.maxTokens !== null) {
+    if (typeof rawModel.maxTokens !== 'number' || !Number.isInteger(rawModel.maxTokens) || rawModel.maxTokens < 1) {
+      return { ok: false, error: 'model.maxTokens must be a positive integer' }
+    }
+    model.maxTokens = rawModel.maxTokens
+  }
+  if (rawModel.reasoningEffort !== undefined && rawModel.reasoningEffort !== null) {
+    if (typeof rawModel.reasoningEffort !== 'string') {
+      return { ok: false, error: 'model.reasoningEffort must be a string' }
+    }
+    model.reasoningEffort = rawModel.reasoningEffort
+  }
+  return { ok: true, value: model }
+}
+
 async function handleEditAgent(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
   if (!getEntry(agentName)) {
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
@@ -850,12 +878,17 @@ async function handleEditAgent(req: IncomingMessage, res: ServerResponse, agentN
     res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: parsedOptions.error }))
     return
   }
+  const parsedModelExtras = parseEditModelExtras(body, parsedOptions.value.model)
+  if (!parsedModelExtras.ok) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: parsedModelExtras.error }))
+    return
+  }
   const parsedLimits = parseAgentLimitsFields(body)
   if (!parsedLimits.ok) {
     res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: parsedLimits.error }))
     return
   }
-  const editFields: AgentEditableFields = { ...parsedOptions.value, ...parsedLimits.value }
+  const editFields: AgentEditableFields = { ...parsedOptions.value, model: parsedModelExtras.value, ...parsedLimits.value }
   if (Object.keys(editFields).length === 0) {
     res
       .writeHead(400, { 'content-type': 'application/json' })
@@ -880,8 +913,27 @@ async function handleEditAgent(req: IncomingMessage, res: ServerResponse, agentN
   if (result.skillIndexBudgetTokens !== undefined) configPatch.skillIndexBudgetTokens = result.skillIndexBudgetTokens
   let createModelCall: RegistryEntry['createModelCall'] | undefined
   if (result.model) {
-    configPatch.model = result.model
-    createModelCall = await synthesizeCreateModelCall(result.model)
+    // editAgentFile's own AgentEditResult.model is one flat shape across
+    // every provider (see that file's own reasoningEffort-only-for-openai
+    // check) — AgentModelConfig is a discriminated union instead, so
+    // reasoningEffort only ever type-checks on the 'openai' branch.
+    // reasoningEffort itself is narrowed no further than `string` at this
+    // boundary (same as `model` — an arbitrary provider-defined name, not
+    // an enum this layer validates); an invalid value surfaces as a clear
+    // rejection from the provider's own API, same as an invalid model name
+    // already does.
+    const m = result.model
+    const modelConfig: AgentModelConfig =
+      m.provider === 'openai'
+        ? {
+            provider: 'openai',
+            model: m.model,
+            maxTokens: m.maxTokens,
+            reasoningEffort: m.reasoningEffort as Extract<AgentModelConfig, { provider: 'openai' }>['reasoningEffort'],
+          }
+        : { provider: m.provider, model: m.model, maxTokens: m.maxTokens }
+    configPatch.model = modelConfig
+    createModelCall = await synthesizeCreateModelCall(modelConfig)
   }
   updateAgent(agentName, { config: configPatch, createModelCall })
 
@@ -2440,6 +2492,14 @@ const server = createServer(async (req, res) => {
 
     await handleMessages(req, res, decodeURIComponent(match[1]))
   } catch (err) {
+    // headersSent means some route already called writeHead (200,
+    // usually) before an awaited call after it threw — the exact
+    // "Unexpected end of JSON input" symptom on the client, since
+    // res.end() here with no argument sends an empty body under
+    // already-committed headers. Logged, not just silently ended, so
+    // that symptom is actually diagnosable from the server side instead
+    // of a client-side error with no server-side trace at all.
+    console.error('[loopengine] unhandled error in request handler:', err)
     if (res.headersSent) {
       res.end()
     } else {
