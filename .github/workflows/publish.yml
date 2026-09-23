@@ -1,0 +1,33 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for npm trusted publishing (OIDC) — no NPM_TOKEN needed
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing (OIDC) needs npm >= 11.5.1 — newer than what
+      # actions/setup-node's bundled npm may ship, so pin explicitly
+      # rather than relying on the runner's default. A specific known-
+      # good version, not "latest": npm 12.x disabled git-spec fetching
+      # by default (EALLOWGIT), which broke loopengine's own
+      # ability-upgrade-git-spec.test.ts the first time this exact
+      # workflow was set up there (this repo's own test suite doesn't
+      # exercise that path, but pin the same known-good version anyway
+      # rather than risk a different future default-behavior surprise).
+      - run: npm install -g npm@11.5.2
+      - run: npm ci
+      - run: npm test
+      - run: npm publish
