@@ -356,7 +356,16 @@ async function describeAgent(entry: RegistryEntry): Promise<Record<string, unkno
     name: config.name,
     systemPrompt: config.systemPrompt,
     model: config.model
-      ? { provider: config.model.provider, model: config.model.model, maxTokens: config.model.maxTokens }
+      ? {
+          provider: config.model.provider,
+          model: config.model.model,
+          maxTokens: config.model.maxTokens,
+          // Only the 'openai' variant of AgentModelConfig carries this —
+          // an `in` check rather than a cast, so a provider that can
+          // never have it just reports undefined instead of needing its
+          // own narrowing branch here.
+          reasoningEffort: 'reasoningEffort' in config.model ? config.model.reasoningEffort : undefined,
+        }
       : 'custom (module exports its own createModelCall)',
     maxTurns: config.maxTurns ?? 25,
     contextBudgetTokens: config.contextBudgetTokens ?? 100000,
