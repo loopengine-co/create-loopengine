@@ -2038,6 +2038,108 @@ async function respondAfterResolution(res: ServerResponse, finalCheckpoint: Turn
   )
 }
 
+// A generated image/archive's own signed cloud-storage URL is a long,
+// high-entropy string (a GCS V4 Signature can run ~300 base64
+// characters) that an agent's own reply has to reproduce character-for-
+// character to embed as a markdown image/link — expensive in output
+// tokens, slow to generate, and one flipped character anywhere in it
+// breaks the whole thing. This route lets a tool return a short, stable
+// object reference instead — bucket + object name, both human-readable,
+// not random — and defer the actual signing to request time, right
+// here, freshly, on every click: shorter for the model to write,
+// nothing random left to transcribe wrong, and a much shorter
+// signed-URL lifetime than an ability calling getSignedUrl itself at
+// generation time ever needed (this one only has to stay valid for as
+// long as the click that requested it takes to resolve, not however
+// long a chat reply might sit around unopened).
+//
+// Deliberately generic, not tied to any one ability — any ability using
+// GCS storage can point a tool's own returned URL here instead of
+// signing itself, as long as it authenticates the same way
+// lp-product-ad-images'/lp-file-archiver's own buildGcsStorageClient
+// already do (GOOGLE_APPLICATION_CREDENTIALS_JSON, falling back to
+// Application Default Credentials) — this is that same logic,
+// centralized, rather than every GCS-backed ability duplicating it
+// (which they already do today for the *upload* side; this just does
+// the same for signing).
+//
+// Sits behind the same isAuthorized() Basic Auth gate every other route
+// on this server already requires (checked once, unconditionally,
+// before any routing below even runs) — not a separately public
+// endpoint. A browser that already loaded /playground has that same
+// origin's Basic Auth credentials cached, so a plain
+// <img src="/gcs-redirect?..."> or download link both just work with no
+// extra wiring; anything without those credentials gets the same 401
+// every other route already gives it.
+async function handleGcsRedirect(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const bucket = url.searchParams.get('bucket')
+  const object = url.searchParams.get('object')
+  const disposition = url.searchParams.get('disposition')
+  const filename = url.searchParams.get('filename')
+
+  if (!bucket || !object) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'gcs-redirect requires both bucket and object query params' }))
+    return
+  }
+  if (disposition && disposition !== 'inline' && disposition !== 'attachment') {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `disposition must be "inline" or "attachment" — got "${disposition}"` }))
+    return
+  }
+
+  // Imported by a variable, not a string literal, so tsc treats this as
+  // Promise<any> instead of trying to resolve @google-cloud/storage's
+  // own types at compile time — same reasoning
+  // lp-product-ad-images'/lp-file-archiver's own saveImage/saveArchive
+  // already use, for the same reason: installing it is only required at
+  // runtime for a deployment that actually uses this route, not every
+  // scaffolded project.
+  const gcsModuleName = '@google-cloud/storage'
+  let gcs: any
+  try {
+    gcs = await import(gcsModuleName)
+  } catch {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(
+      JSON.stringify({ error: 'gcs-redirect requires the @google-cloud/storage package — npm install @google-cloud/storage in your own project.' }),
+    )
+    return
+  }
+
+  let client: any
+  const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON
+  if (credentialsJson) {
+    let credentials: { project_id?: string }
+    try {
+      credentials = JSON.parse(credentialsJson)
+    } catch {
+      res.writeHead(500, { 'content-type': 'application/json' }).end(
+        JSON.stringify({
+          error: 'GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON — paste the entire contents of the downloaded service-account key file, unedited.',
+        }),
+      )
+      return
+    }
+    client = new gcs.Storage({ credentials, projectId: credentials.project_id })
+  } else {
+    client = new gcs.Storage()
+  }
+
+  try {
+    const file = client.bucket(bucket).file(object)
+    const expires = Date.now() + 5 * 60 * 1000
+    const signOptions: Record<string, unknown> = { action: 'read', expires }
+    if (disposition === 'attachment') {
+      signOptions.responseDisposition = `attachment; filename="${filename || object.split('/').pop()}"`
+    }
+    const [signedUrl] = await file.getSignedUrl(signOptions)
+    res.writeHead(302, { location: signedUrl }).end()
+  } catch (err) {
+    res
+      .writeHead(502, { 'content-type': 'application/json' })
+      .end(JSON.stringify({ error: `gcs-redirect: could not sign a URL for gs://${bucket}/${object}: ${err instanceof Error ? err.message : String(err)}` }))
+  }
+}
+
 const server = createServer(async (req, res) => {
   if (!isAuthorized(req)) {
     res
@@ -2481,6 +2583,11 @@ const server = createServer(async (req, res) => {
     const actauthMatch = req.method === 'GET' && pathname.match(/^\/agents\/([^/]+)\/actauth$/)
     if (actauthMatch) {
       handleActauthGet(res, decodeURIComponent(actauthMatch[1]))
+      return
+    }
+
+    if (req.method === 'GET' && pathname === '/gcs-redirect') {
+      await handleGcsRedirect(req, res)
       return
     }
 
