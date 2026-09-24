@@ -2511,8 +2511,62 @@ const server = createServer(async (req, res) => {
 const port = Number(process.env.PORT ?? 8787)
 server.listen(port, () => console.log(`agent API listening on :${port}`))
 
+// server.close() alone only stops accepting *new* connections — it
+// doesn't wait for existing ones, and the old code called process.exit
+// right after it regardless, killing every still-open connection
+// immediately. A long-lived SSE stream (the Playground's own
+// /messages/stream, open for a whole turn — longer still if the model
+// polls a background job within that same turn) dies mid-response, and
+// whatever's in front of this process (a load balancer, a reverse
+// proxy) sees the backend vanish mid-stream and reports a 502 to
+// whoever was watching it — confirmed live: a `pm2 restart` while an
+// image-generation batch was in progress produced exactly that. Now
+// actually waits for server.close()'s own callback (fires once every
+// in-flight connection has closed on its own) before tearing anything
+// else down — bounded by LOOPENGINE_SHUTDOWN_GRACE_MS so a genuinely
+// stuck connection can't hang a deploy forever. Whatever's orchestrating
+// the restart (pm2's own kill_timeout, a container platform's own grace
+// period) needs to be at least this long too, or it'll SIGKILL out from
+// under this before the wait finishes — SIGKILL can't be caught or
+// delayed by anything here.
+//
+// This only protects the *connection* a request/stream is running
+// over. A tool's own background work that isn't awaited by its
+// execute() call (e.g. a batch job that returns a job_id immediately
+// and keeps working after) isn't tied to any connection at all, and
+// still dies the instant process.exit runs regardless of how long this
+// grace period is — there's no persistent job queue here surviving a
+// process restart, just this one process's own event loop.
 async function shutdown() {
-  server.close()
+  console.log('[loopengine] shutting down — draining in-flight requests...')
+  const graceMs = Number(process.env.LOOPENGINE_SHUTDOWN_GRACE_MS ?? 30000)
+  const closed = new Promise<void>((resolve) => server.close(() => resolve()))
+  // HTTP keep-alive means a connection whose last request already
+  // finished doesn't close itself — it sits open, idle, waiting for a
+  // *next* request that (mid-restart) is never coming, which would
+  // otherwise hold server.close()'s own callback back for the entire
+  // grace period even though nothing real is still in flight on it —
+  // confirmed live: an idle keep-alive socket alone reproduced the full
+  // wait. closeIdleConnections() (Node >= 18.2) drops exactly those
+  // (never an actively-streaming request/response, which is the one
+  // thing this whole function exists to protect) right away — but only
+  // the ones idle *at the instant it's called*. A connection that's
+  // still active right now (the actual case this whole function exists
+  // to protect) goes idle *later*, once its own response finishes, so a
+  // single call up front misses it — confirmed live: without the
+  // repeated sweep below, that connection's own idle socket still held
+  // the grace period open right up to the timeout, same as if this call
+  // were never made at all. Repeating it on an interval catches that as
+  // soon as it happens, instead of only ever catching sockets already
+  // idle before shutdown even began.
+  server.closeIdleConnections()
+  const sweep = setInterval(() => server.closeIdleConnections(), 1000)
+  const timedOut = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), graceMs))
+  const outcome = await Promise.race([closed.then(() => 'closed' as const), timedOut])
+  clearInterval(sweep)
+  if (outcome === 'timeout') {
+    console.log(`[loopengine] shutdown grace period (${graceMs}ms) elapsed with connections still open — exiting anyway`)
+  }
   await sessions.close()
   process.exit(0)
 }
