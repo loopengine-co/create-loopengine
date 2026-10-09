@@ -94,6 +94,10 @@ import {
   listDeclaredEnvVars,
   setEnvVar,
   unsetEnvVar,
+  setAgentEnvVar,
+  unsetAgentEnvVar,
+  createAgentEnv,
+  agentDirFor,
   EnvVarNameError,
   readActauthConfig,
   addActauthRule,
@@ -1024,6 +1028,14 @@ function handleEnvGet(res: ServerResponse, agentName: string): void {
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(listDeclaredEnvVars(agentName)))
 }
 
+// `?slot=agent` targets this agent's own agents/<name>/.env (a per-agent
+// value, read by its tools through ToolContext.env) instead of the
+// project-wide .env — see loopengine's DeclaredEnvVar.slot.
+function envSlotOf(req: IncomingMessage): 'shared' | 'agent' | undefined {
+  const slot = new URL(req.url ?? '/', 'http://localhost').searchParams.get('slot') ?? 'shared'
+  return slot === 'shared' || slot === 'agent' ? slot : undefined
+}
+
 // Writes a raw secret value into .env — meaningfully more sensitive than
 // the rest of the admin surface (config/business data vs. an actual
 // credential), so unlike every other route here, this one refuses
@@ -1043,16 +1055,31 @@ async function handleEnvPut(req: IncomingMessage, res: ServerResponse, agentName
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
     return
   }
+  const slot = envSlotOf(req)
+  if (!slot) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: "slot must be 'shared' or 'agent'" }))
+    return
+  }
   const body = await readJsonBody(req)
   if (typeof body.value !== 'string') {
     res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'value is required' }))
+    return
+  }
+  const declaredRows = listDeclaredEnvVars(agentName).filter((v) => v.name === varName)
+  // A shared value for an agent-scoped var would never be read
+  // (loopengine's createAgentEnv never falls back for one) — refuse it
+  // rather than accept a write that silently does nothing.
+  if (slot === 'shared' && declaredRows.some((v) => v.scope === 'agent')) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(
+      JSON.stringify({ error: `${varName} is declared scope 'agent' — set it per agent (slot=agent), not project-wide.` }),
+    )
     return
   }
   // A dropdown-backed var (AbilityEnvDecl.options) is still writable
   // through this same raw route — worth rejecting an out-of-set value
   // here too, not just skipping validation because the Admin UI's own
   // <select> would never have produced one.
-  const declared = listDeclaredEnvVars(agentName).find((v) => v.name === varName)
+  const declared = declaredRows.find((v) => v.slot === slot) ?? declaredRows[0]
   if (declared?.options && !declared.options.includes(body.value)) {
     res.writeHead(400, { 'content-type': 'application/json' }).end(
       JSON.stringify({ error: `"${body.value}" isn't one of this var's allowed values: ${declared.options.join(', ')}` }),
@@ -1060,7 +1087,8 @@ async function handleEnvPut(req: IncomingMessage, res: ServerResponse, agentName
     return
   }
   try {
-    setEnvVar(varName, body.value)
+    if (slot === 'agent') setAgentEnvVar(agentName, varName, body.value)
+    else setEnvVar(varName, body.value)
   } catch (err) {
     const status = err instanceof EnvVarNameError ? 400 : 500
     res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
@@ -1073,7 +1101,7 @@ async function handleEnvPut(req: IncomingMessage, res: ServerResponse, agentName
 // removing a secret from .env is still a secrets-management action,
 // not just config, so this refuses outright rather than proceeding
 // open when LOOPENGINE_ADMIN_AUTH isn't configured at all.
-async function handleEnvDelete(res: ServerResponse, agentName: string, varName: string): Promise<void> {
+async function handleEnvDelete(req: IncomingMessage, res: ServerResponse, agentName: string, varName: string): Promise<void> {
   if (!adminAuth) {
     res.writeHead(403, { 'content-type': 'application/json' }).end(
       JSON.stringify({ error: 'Refusing to unset an env var without LOOPENGINE_ADMIN_AUTH configured — set it before managing secrets through this route.' }),
@@ -1084,8 +1112,14 @@ async function handleEnvDelete(res: ServerResponse, agentName: string, varName: 
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
     return
   }
+  const slot = envSlotOf(req)
+  if (!slot) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: "slot must be 'shared' or 'agent'" }))
+    return
+  }
   try {
-    unsetEnvVar(varName)
+    if (slot === 'agent') unsetAgentEnvVar(agentName, varName)
+    else unsetEnvVar(varName)
   } catch (err) {
     const status = err instanceof EnvVarNameError ? 400 : 500
     res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
@@ -1927,7 +1961,12 @@ async function handlePendingApprovalResolve(req: IncomingMessage, res: ServerRes
           return { checkpoint, result: { kind: 'validation-error', error: validationError } }
         }
         try {
-          const output = await tool.execute(editedArgs ?? item.args)
+          const output = await tool.execute(editedArgs ?? item.args, {
+            agentName: entry.config.name,
+            tenant: checkpoint.tenant,
+            sessionId: checkpoint.sessionId,
+            env: createAgentEnv(entry.config.name, agentDirFor(entry.config)),
+          })
           resultBlock = { type: 'tool_result', tool_use_id: item.toolUseId, content: JSON.stringify(output), is_error: false }
         } catch (err) {
           resultBlock = { type: 'tool_result', tool_use_id: item.toolUseId, content: `ERROR: ${err}`, is_error: true }
@@ -2626,7 +2665,7 @@ const server = createServer(async (req, res) => {
       return
     }
     if (envVarMatch && req.method === 'DELETE') {
-      await handleEnvDelete(res, decodeURIComponent(envVarMatch[1]), decodeURIComponent(envVarMatch[2]))
+      await handleEnvDelete(req, res, decodeURIComponent(envVarMatch[1]), decodeURIComponent(envVarMatch[2]))
       return
     }
 
