@@ -311,7 +311,9 @@ function resolveLatestVersionFromNpm(pkg: string): string {
 }
 
 function runRealNpmInstall(projectDir: string): void {
-  execFileSync('npm', ['install'], { cwd: projectDir, stdio: 'pipe' })
+  // --include=dev: with NODE_ENV=production npm would drop devDependencies,
+  // and an older project still lists tsx, which runs it, as one.
+  execFileSync('npm', ['install', '--include=dev'], { cwd: projectDir, stdio: 'pipe' })
 }
 
 // Only loopengine/actauth/skillgarden — the three packages a scaffolded

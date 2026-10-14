@@ -9,12 +9,12 @@
     "cli": "tsx adapters/cli.ts"
   },
   "dependencies": {
-    "loopengine": "^0.1.76",
-    "actauth": "^0.0.12"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.0",
+    "loopengine": "^0.1.77",
+    "actauth": "^0.0.12",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
   }
 }
