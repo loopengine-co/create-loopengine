@@ -101,7 +101,10 @@ const UPGRADE_CANDIDATE_FILES: { templatePath: string; projectPath: string }[] =
   { templatePath: '_gitignore', projectPath: '.gitignore' },
 ]
 
-export type UpgradeFileStatus = 'updated' | 'unchanged' | 'conflict' | 'skipped'
+/** `kept`: the project edited a file the template also changed, and
+ * `keepEdited` was set, so it was left exactly as it was (no merge, no
+ * conflict markers). */
+export type UpgradeFileStatus = 'updated' | 'unchanged' | 'conflict' | 'skipped' | 'kept'
 
 export interface UpgradeFileResult {
   file: string
@@ -151,6 +154,11 @@ export interface UpgradeOptions {
   /** Runs `npm install` in projectDir — defaults to a real one. Test-only
    * seam to avoid actually installing anything during tests. */
   runNpmInstall?: (projectDir: string) => void
+  /** Leave a file the project edited untouched (status `kept`) instead of
+   * three-way merging it, so nothing ever gets conflict markers. For
+   * unattended upgrades (the console's Upgrade button): a half-merged
+   * adapters/http.ts would stop the server from starting at all. */
+  keepEdited?: boolean
 }
 
 // npm keeps every published tarball forever, so the historical template
@@ -204,6 +212,7 @@ function upgradeFile(
   baseTemplateDir: string,
   currentTemplateDir: string,
   projectDir: string,
+  keepEdited = false,
 ): UpgradeFileResult {
   const projectFilePath = join(projectDir, candidate.projectPath)
   const baseFilePath = join(baseTemplateDir, candidate.templatePath)
@@ -223,6 +232,16 @@ function upgradeFile(
   }
 
   const mine = readFileSync(projectFilePath, 'utf8')
+  // The common cases need no merge (and so no git): a file the project
+  // never edited takes the new template as is, and one that already
+  // matches it has nothing to do.
+  if (mine === theirs) return { file: candidate.projectPath, status: 'unchanged' }
+  if (mine === base) {
+    writeFileSync(projectFilePath, theirs)
+    return { file: candidate.projectPath, status: 'updated' }
+  }
+  if (keepEdited) return { file: candidate.projectPath, status: 'kept' }
+
   const scratchDir = mkdtempSync(join(tmpdir(), 'create-loopengine-merge-'))
   const mineTmp = join(scratchDir, 'mine')
   const baseTmp = join(scratchDir, 'base')
@@ -261,7 +280,7 @@ export function upgradeProject(options: UpgradeOptions = {}): UpgradeResult {
   const resolveBase = options.resolveBaseTemplateDir ?? fetchPublishedTemplateDir
   const baseTemplateDir = resolveBase(fromVersion)
 
-  const files = UPGRADE_CANDIDATE_FILES.map((candidate) => upgradeFile(candidate, baseTemplateDir, currentTemplateDir, projectDir))
+  const files = UPGRADE_CANDIDATE_FILES.map((candidate) => upgradeFile(candidate, baseTemplateDir, currentTemplateDir, projectDir, options.keepEdited))
 
   const resolveLatestVersion = options.resolveLatestVersion ?? resolveLatestVersionFromNpm
   const dependencies = bumpDependencies(projectDir, resolveLatestVersion)
@@ -339,19 +358,23 @@ function bumpDependencies(projectDir: string, resolveLatestVersion: (pkg: string
   return changes
 }
 
-function parseUpgradeArgs(argv: string[]): { from?: string } {
+function parseUpgradeArgs(argv: string[]): { from?: string; json: boolean; keepEdited: boolean } {
   let from: string | undefined
+  let json = false
+  let keepEdited = false
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--from') from = argv[++i]
+    else if (argv[i] === '--json') json = true
+    else if (argv[i] === '--keep-edited') keepEdited = true
   }
-  return { from }
+  return { from, json, keepEdited }
 }
 
 function printUpgradeSummary(result: UpgradeResult): void {
   console.log(`Upgrading create-loopengine@${result.fromVersion} -> @${result.toVersion}`)
   console.log()
   for (const f of result.files) {
-    const label = f.status === 'updated' ? 'updated  ' : f.status === 'conflict' ? 'conflict ' : f.status === 'unchanged' ? 'unchanged' : 'skipped  '
+    const label = f.status === 'updated' ? 'updated  ' : f.status === 'conflict' ? 'conflict ' : f.status === 'unchanged' ? 'unchanged' : f.status === 'kept' ? 'kept     ' : 'skipped  '
     console.log(`  ${label}  ${f.file}`)
   }
   console.log()
@@ -380,8 +403,19 @@ function parseArgs(argv: string[]): { name: string } {
 export function main(argv: string[] = process.argv.slice(2)): void {
   try {
     if (argv[0] === 'upgrade') {
-      const { from } = parseUpgradeArgs(argv.slice(1))
-      printUpgradeSummary(upgradeProject({ from }))
+      const { from, json, keepEdited } = parseUpgradeArgs(argv.slice(1))
+      if (json) {
+        // One JSON object on stdout, for a program driving the upgrade
+        // (loopengine's console); errors become { error } with exit 1.
+        try {
+          console.log(JSON.stringify(upgradeProject({ from, keepEdited })))
+        } catch (err) {
+          console.log(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+          process.exitCode = 1
+        }
+        return
+      }
+      printUpgradeSummary(upgradeProject({ from, keepEdited }))
       return
     }
     const { name } = parseArgs(argv)

@@ -87,6 +87,36 @@ describe('upgradeProject', () => {
     expect(result.files.every((f) => f.status === 'unchanged')).toBe(true)
   })
 
+  it('keeps an edited file exactly as it was with keepEdited, still updating unedited ones', () => {
+    const baseTemplateDir = makeTemplateDir('line3')
+    const currentTemplateDir = makeTemplateDir('line3-updated')
+    writeFileSync(join(currentTemplateDir, 'agent-registry.ts'), 'registry updated\n')
+    const edited = 'line1-mine\nline2\nline3\nline4\nline5\n'
+    const projectDir = makeProjectDir('1.0.0', edited)
+
+    const result = upgradeProject({ projectDir, currentTemplateDir, resolveBaseTemplateDir: () => baseTemplateDir, keepEdited: true })
+
+    expect(result.files.find((f) => f.file === 'adapters/http.ts')?.status).toBe('kept')
+    expect(readFileSync(join(projectDir, 'adapters', 'http.ts'), 'utf8')).toBe(edited)
+    expect(result.files.find((f) => f.file === 'agent-registry.ts')?.status).toBe('updated')
+    expect(readFileSync(join(projectDir, 'agent-registry.ts'), 'utf8')).toBe('registry updated\n')
+  })
+
+  it('needs no git for a file the project never edited, or one already at the new version', () => {
+    const baseTemplateDir = makeTemplateDir('line3')
+    const currentTemplateDir = makeTemplateDir('line3-updated')
+    const projectDir = makeProjectDir('1.0.0', 'line1\nline2\nline3-updated\nline4\nline5\n')
+    const unedited = makeProjectDir('1.0.0', 'line1\nline2\nline3\nline4\nline5\n')
+    const path = process.env.PATH
+    process.env.PATH = '/nonexistent' // git (and everything else) unreachable
+    try {
+      expect(upgradeProject({ projectDir, currentTemplateDir, resolveBaseTemplateDir: () => baseTemplateDir }).files.find((f) => f.file === 'adapters/http.ts')?.status).toBe('unchanged')
+      expect(upgradeProject({ projectDir: unedited, currentTemplateDir, resolveBaseTemplateDir: () => baseTemplateDir }).files.find((f) => f.file === 'adapters/http.ts')?.status).toBe('updated')
+    } finally {
+      process.env.PATH = path
+    }
+  })
+
   it('refuses without a recorded or explicit version', () => {
     const baseTemplateDir = makeTemplateDir('line3')
     const currentTemplateDir = makeTemplateDir('line3-updated')

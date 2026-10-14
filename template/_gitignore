@@ -6,3 +6,5 @@ dist
 .env
 *.log
 .DS_Store
+# Backups the console Upgrade button keeps of the files it changed.
+.upgrade-backups
