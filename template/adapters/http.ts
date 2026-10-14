@@ -153,6 +153,9 @@ import {
   searchPublicAbilities,
   fetchLatestAbilityVersion,
   describeModelProviders,
+  setModelProviderKey,
+  clearModelProviderKey,
+  ModelKeyError,
   describeGateways,
   scaffoldAgent,
   AgentNameError,
@@ -2982,7 +2985,31 @@ const server = createServer(async (req, res) => {
       return
     }
     if (req.method === 'GET' && pathname === '/config/models') {
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(describeModelProviders(listAgents(), (name) => getEntry(name)?.config)))
+      res.writeHead(200, { 'content-type': 'application/json' }).end(
+        JSON.stringify({ ...describeModelProviders(listAgents(), (name) => getEntry(name)?.config), canSave: secretsProtected }),
+      )
+      return
+    }
+    // A provider's API key, from the Models page: write-only, never read
+    // back. Same rule as the Environment tab: refused on a server with no
+    // auth, since anyone who could reach it could replace the key.
+    const modelKeyMatch = (req.method === 'PUT' || req.method === 'DELETE') && pathname.match(/^\/config\/models\/([a-z]+)\/key$/)
+    if (modelKeyMatch) {
+      if (!secretsProtected) {
+        res.writeHead(403, { 'content-type': 'application/json' }).end(
+          JSON.stringify({ error: 'Refusing to store an API key without LOOPENGINE_ADMIN_AUTH configured: set it first, or put the key in .env.' }),
+        )
+        return
+      }
+      try {
+        if (req.method === 'PUT') await setModelProviderKey(modelKeyMatch[1], (await readJsonBody(req)).key)
+        else await clearModelProviderKey(modelKeyMatch[1])
+      } catch (err) {
+        const status = err instanceof ModelKeyError ? 400 : 500
+        res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true }))
       return
     }
     if (req.method === 'GET' && pathname === '/config/gateways') {
