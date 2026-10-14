@@ -12,18 +12,17 @@
 // resolves relative to loopengine's own installed location, not your
 // project, so it only works inside loopengine's own repo — see
 // tools/index.ts's own comment.
-import { createAnthropicModelCall, type AgentConfig, type ModelCall } from 'loopengine'
+import type { AgentConfig } from 'loopengine'
 import { tools } from './tools/index.js'
 
 export const config: AgentConfig = {
   name: 'example-agent',
   systemPrompt: 'You are a helpful assistant.',
   tools,
-}
-
-// Reads ANTHROPIC_API_KEY from the env. Swap for
-// createOpenAIModelCall({ model: '...' }) to use OpenAI instead — see
-// node_modules/loopengine/README.md's "Wiring a real model" section.
-export function createModelCall(): ModelCall {
-  return createAnthropicModelCall({ model: 'claude-sonnet-5' })
+  // Reads OPENAI_API_KEY: set it on the console's Models page, or in .env.
+  // For another provider, change `provider` and `model` (e.g.
+  // { provider: 'anthropic', model: 'claude-sonnet-5' } with
+  // ANTHROPIC_API_KEY). reasoningEffort 'none' lets this gpt-5.x model use
+  // function tools; see AgentModelConfig in loopengine's agent-config.
+  model: { provider: 'openai', model: 'gpt-5.6-luna', reasoningEffort: 'none' },
 }

@@ -6,7 +6,7 @@ An agent server built with [loopengine](https://www.npmjs.com/package/loopengine
 
 ```bash
 npm install
-cp .env.example .env   # fill in ANTHROPIC_API_KEY
+cp .env.example .env   # fill in OPENAI_API_KEY (or set it later on the Models page)
 ```
 
 ## Run

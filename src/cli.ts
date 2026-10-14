@@ -390,7 +390,7 @@ export function main(argv: string[] = process.argv.slice(2)): void {
     console.log()
     console.log(`  cd ${destination}`)
     console.log('  npm install')
-    console.log('  cp .env.example .env   # fill in ANTHROPIC_API_KEY')
+    console.log('  cp .env.example .env   # fill in OPENAI_API_KEY (or set it on the Models page)')
     console.log('  npm run dev')
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err))

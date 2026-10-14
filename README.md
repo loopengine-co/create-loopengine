@@ -16,7 +16,7 @@ clone of loopengine's own source repo.
 npx create-loopengine@latest my-agents
 cd my-agents
 npm install
-cp .env.example .env   # fill in ANTHROPIC_API_KEY
+cp .env.example .env   # fill in OPENAI_API_KEY (or set it later on the Models page)
 npm run dev             # HTTP server on :8787
 ```
 
