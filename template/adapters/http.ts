@@ -124,6 +124,7 @@ import {
   listAgentPending,
   listAgentSlackChannels,
   slackCredentialsFor,
+  slackConversationsOn,
   openSlackAnswerModal,
   parseSlackInteraction,
   replyInSlack,
@@ -2758,7 +2759,7 @@ async function handleSlackEvents(req: IncomingMessage, res: ServerResponse, agen
   }
   // Slack wants an answer within three seconds; the reply is posted after.
   res.writeHead(200).end()
-  if (event.type !== 'message' || !firstSighting(event)) return
+  if (event.type !== 'message' || !firstSighting(event) || !slackConversationsOn(entry.config)) return
   const environment = process.env.LOOPENGINE_ENV ?? 'production'
   await handleInboundMessage(event, {
     agentName,
