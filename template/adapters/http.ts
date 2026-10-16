@@ -135,6 +135,7 @@ import {
   type DecisionOutcome,
   type MessagingDeps,
   handleMessagingAction,
+  settleThreadChoice,
   describeChange,
   openSlackAnswerModal,
   parseSlackInteraction,
@@ -2803,6 +2804,12 @@ async function handleSlackInteraction(req: IncomingMessage, res: ServerResponse,
   if (interaction.type === 'decide') await resolvePendingApproval(capture.res, interaction.pendingId, { decision: interaction.decision })
   else await answerPendingQuestion(capture.res, interaction.pendingId, { answer: interaction.answer })
   const outcome = await capture.done
+  // A proposed change or a Confirm still waiting in the thread no longer
+  // applies: replace it so its buttons don't linger.
+  if (botToken && outcome.status < 400 && !outcome.body.alreadyResolved) {
+    const done = interaction.type === 'decide' ? (interaction.decision === 'approve' ? 'Approved' : 'Denied') : 'Answered'
+    await settleThreadChoice(slackMessagingDeps(agentName, entry, botToken), interaction.pendingId, `${done}${interaction.user ? ` by <@${interaction.user}>` : ''} with the request's own buttons.`).catch((err) => console.error('[loopengine] Slack update failed:', err))
+  }
   if (interaction.responseUrl) {
     let text = slackOutcomeText(interaction.type === 'decide' ? interaction.decision : 'answer', outcome.status, outcome.body, interaction.user)
     if (ran && outcome.status < 400 && !outcome.body.alreadyResolved) text += ran
