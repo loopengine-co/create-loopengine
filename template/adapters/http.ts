@@ -82,10 +82,16 @@ import {
   interviewTools,
   listInterviews,
   pickInterviewModel,
+  pickAgentModel,
   previewCandidate,
   startInterview,
   setInterviewProject,
   type InterviewAgentSource,
+  templatesPageHtml,
+  TemplateError,
+  createFromTemplate,
+  listTemplates,
+  previewTemplate,
   globalConfigPageHtml,
   addGatewayTool,
   agentDir,
@@ -955,6 +961,44 @@ async function handleInterviews(req: IncomingMessage, res: ServerResponse, pathn
     if (err instanceof InterviewError) return json(message === 'No such interview' || message === 'No such candidate' ? 404 : 400, { error: message })
     console.error('[loopengine] interview failed:', err)
     return json(502, { error: `The interviewer couldn't answer: ${message}` })
+  }
+}
+
+// Templates (loopengine's web/templates-admin.ts): ready-made agents,
+// created through the same scaffold and registration as Agents → + New.
+// A template agent takes the model of an agent that already works here,
+// as an interview's does; with none, it starts on the scaffold's default.
+async function handleStarterTemplates(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+  }
+  const [id, action] = pathname.split('/').slice(2).map(decodeURIComponent) // after /starter-templates
+  const exists = (name: string) => Boolean(getEntry(name)) || existsSync(join(projectDir(), 'agents', name))
+  try {
+    if (!id) {
+      if (req.method === 'GET') return json(200, { templates: listTemplates() })
+      return json(405, { error: 'method not allowed' })
+    }
+    if (action === 'preview' && req.method === 'GET') return json(200, previewTemplate(id, { agentExists: exists }))
+    if (action === 'create' && req.method === 'POST') {
+      const model = pickAgentModel(interviewAgents())
+      const created = await createFromTemplate(id, {
+        agentExists: exists,
+        createAgent: async (name, systemPrompt) => {
+          const parsed = parseAgentTemplateOptions({ systemPrompt, ...(model ? { model } : {}) })
+          if (!parsed.ok) throw new TemplateError(parsed.error)
+          const indexPath = await scaffoldAgent(projectDir(), name, parsed.value)
+          registerAgent(await loadAgentModule(indexPath, indexPath))
+        },
+      })
+      return json(200, created)
+    }
+    return json(404, { error: 'not found' })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (err instanceof TemplateError) return json(message === 'No such template' ? 404 : 400, { error: message })
+    console.error('[loopengine] template failed:', err)
+    return json(500, { error: `Couldn't create it: ${message}` })
   }
 }
 
@@ -3270,6 +3314,15 @@ const server = createServer(async (req, res) => {
     }
     if (pathname === '/interviews' || pathname.startsWith('/interviews/')) {
       await handleInterviews(req, res, pathname)
+      return
+    }
+    // Templates: the page, and its routes.
+    if (req.method === 'GET' && pathname === '/templates') {
+      res.writeHead(200, { 'content-type': 'text/html' }).end(templatesPageHtml)
+      return
+    }
+    if (pathname === '/starter-templates' || pathname.startsWith('/starter-templates/')) {
+      await handleStarterTemplates(req, res, pathname)
       return
     }
     const editAgentMatch = req.method === 'PUT' && pathname.match(/^\/agents\/([^/]+)$/)
