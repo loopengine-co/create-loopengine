@@ -148,6 +148,7 @@ import {
   slackClickAllowed,
   agentApprovers,
   setAgentApprovers,
+  setAgentPrimaryNotifier,
   listAgentSlackMembers,
   replyPrivatelyInSlack,
   slackArgs,
@@ -189,6 +190,22 @@ import {
   AbilityNotInstalledError,
   searchPublicAbilities,
   fetchLatestAbilityVersion,
+  describeAbilitySources,
+  listPrivateAbilities,
+  removeAbilitySourceFromConsole,
+  saveAbilitySourceFromConsole,
+  abilityDetails,
+  MAX_UPLOAD_BYTES,
+  installUploadedAbility,
+  installWorkspaceAbility,
+  type AbilityUpload,
+  WorkspaceAbilityError,
+  listWorkspaceAbilities,
+  removeWorkspaceAbility,
+  AbilitySourceError,
+  abilityOrigin,
+  readAbilitySources,
+  type AbilitySource,
   describeModelProviders,
   loopengineVersion,
   describeUpgrade,
@@ -196,6 +213,7 @@ import {
   UpgradeError,
   setModelProviderKey,
   clearModelProviderKey,
+  listProviderModels,
   ModelKeyError,
   describeTimeZone,
   setWorkspaceTimeZone,
@@ -315,6 +333,32 @@ function readRawBody(req: IncomingMessage): Promise<string> {
     let data = ''
     req.on('data', (chunk) => (data += chunk))
     req.on('end', () => resolve(data))
+    req.on('error', reject)
+  })
+}
+
+/** readJsonBody with a size cap, for uploads: a body past `maxBytes` is
+ * refused before it's all read. */
+function readLimitedJsonBody(req: IncomingMessage, maxBytes: number): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        reject(new WorkspaceAbilityError('The upload is larger than 25 MB'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {})
+      } catch (err) {
+        reject(err)
+      }
+    })
     req.on('error', reject)
   })
 }
@@ -866,7 +910,9 @@ function parseAgentTemplateOptions(body: Record<string, unknown>): { ok: true; v
       provider !== 'deepseek' &&
       provider !== 'kimi' &&
       provider !== 'glm' &&
-      provider !== 'gemini'
+      provider !== 'gemini' &&
+      provider !== 'xai' &&
+      provider !== 'meta'
     ) {
       return { ok: false, error: `unsupported model provider '${String(provider)}'` }
     }
@@ -1367,7 +1413,8 @@ async function handleNotifierPut(req: IncomingMessage, res: ServerResponse, agen
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ...describeAgentNotifier(entry.config, defaultWebhook), canSave: secretsProtected }))
 }
 
-function handleNotifierDelete(res: ServerResponse, agentName: string): void {
+// `channel` removes just that app's connection; without it, all of them.
+function handleNotifierDelete(res: ServerResponse, agentName: string, channel?: string): void {
   if (!secretsProtected) {
     res.writeHead(403, { 'content-type': 'application/json' }).end(
       JSON.stringify({ error: 'Refusing to remove a notifier without LOOPENGINE_ADMIN_AUTH configured.' }),
@@ -1379,17 +1426,42 @@ function handleNotifierDelete(res: ServerResponse, agentName: string): void {
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
     return
   }
-  removeAgentNotifier(entry.config)
+  removeAgentNotifier(entry.config, channel)
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ...describeAgentNotifier(entry.config, defaultWebhook), canSave: secretsProtected }))
 }
 
-async function handleNotifierTest(res: ServerResponse, agentName: string): Promise<void> {
+// A body naming a `channel` tests that app's saved connection, primary
+// or not; without one, whichever notifier applies.
+async function handleNotifierTest(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
   const entry = getEntry(agentName)
   if (!entry) {
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
     return
   }
-  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await testAgentNotifier(entry.config, defaultWebhook)))
+  const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>)
+  const channel = typeof body.channel === 'string' ? body.channel : undefined
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await testAgentNotifier(entry.config, defaultWebhook, channel)))
+}
+
+// The Messaging tab's "Make primary": which saved connection is used.
+async function handleNotifierPrimaryPut(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
+  if (!secretsProtected) {
+    res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Refusing to change the notifier without LOOPENGINE_ADMIN_AUTH configured.' }))
+    return
+  }
+  const entry = getEntry(agentName)
+  if (!entry) {
+    res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
+    return
+  }
+  try {
+    setAgentPrimaryNotifier(entry.config, (await readJsonBody(req)).channel)
+  } catch (err) {
+    const status = err instanceof NotifierFileError ? 400 : 500
+    res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ...describeAgentNotifier(entry.config, defaultWebhook), canSave: secretsProtected }))
 }
 
 // Backs the console's Slack channel picker. A bot token typed into the form
@@ -1585,6 +1657,10 @@ async function handleAbilitiesGet(res: ServerResponse, agentName: string): Promi
     return
   }
   const installed = listInstalledAbilities(agentName)
+  let sources: AbilitySource[] = []
+  try {
+    sources = readAbilitySources()
+  } catch {}
   const abilities = await Promise.all(
     installed.map(async (a) => {
       // a.dependencies is only ever undefined for a record from before
@@ -1594,9 +1670,13 @@ async function handleAbilitiesGet(res: ServerResponse, agentName: string): Promi
       // otherwise permanently hide "Install deps" for an ability that
       // genuinely still needs something.
       const dependencies = a.dependencies !== undefined ? a.dependencies : ((await backfillDependencies(agentName, a.name)) ?? [])
-      const latestVersion = await fetchLatestAbilityVersion(a.name)
+      // Public or private, for the console's badge. Only a public one is
+      // checked against npm for a newer version: a private ability could
+      // share its name with an unrelated public package.
+      const origin = abilityOrigin(a.spec, a.name, sources)
+      const latestVersion = origin.kind === 'public' ? await fetchLatestAbilityVersion(a.name) : null
       const missingDependencies = dependencies.filter((dep) => !hasNodeModule(dep))
-      return { ...a, dependencies, latestVersion, upToDate: latestVersion !== null && latestVersion === a.version, missingDependencies }
+      return { ...a, origin, dependencies, latestVersion, upToDate: latestVersion !== null && latestVersion === a.version, missingDependencies }
     }),
   )
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ abilities }))
@@ -1786,12 +1866,86 @@ function parseActauthRuleBody(body: Record<string, unknown>, requireName: boolea
   return { ok: true, value: { name: typeof body.name === 'string' ? body.name : '', scope: body.scope, tool: body.tool, decision: body.decision } }
 }
 
-function handleActauthGet(res: ServerResponse, agentName: string): void {
+// The Permissions data. `rules`: every rule, each with the ability it
+// belongs to (empty for none): the one that added it when installed, else
+// the one whose tool it's for. Edited in full from the Advanced tab.
+// `tools`: every tool the agent has (its own, subagents, Composio), each
+// with its ability and decision: its rule for everyone (*/*), else its
+// first rule, else the default; `scopeNote` says when that isn't the whole
+// story, so the Permissions tab doesn't look like it has duplicates.
+async function actauthConfigWithAbilities(agentName: string) {
+  const config = readActauthConfig(agentName)
+  let installed: Array<{ name: string; tools: string[]; actauthRules: string[] }> = []
+  try {
+    installed = listInstalledAbilities(agentName)
+  } catch {}
+  const abilityFor = (tool: string, ruleName?: string) =>
+    (installed.find((a) => ruleName && a.actauthRules.includes(ruleName)) ?? installed.find((a) => a.tools.includes(tool)))?.name ?? null
+  const rules = config.rules.map((rule) => ({ ...rule, ability: abilityFor(rule.tool, rule.name) }))
+
+  const entry = getEntry(agentName)
+  let toolNames: string[] = []
+  if (entry) {
+    try {
+      const own = entry.config.tools ?? (await loadDefaultTools(entry.config))
+      const all = [...own, ...(await loadSubagentAsTools(entry.config)), ...(await loadGatewayToolsFromDir(agentDir(agentName)))]
+      toolNames = [...new Set(all.map((t) => t.name))]
+    } catch {}
+  }
+  const tools = toolNames.map((tool) => {
+    const forTool = rules.filter((r) => r.tool === tool)
+    const rule = forTool.find((r) => r.scope === '*/*') ?? forTool[0]
+    const others = forTool.length - (rule ? 1 : 0)
+    const scopeNote = rule && rule.scope !== '*/*' ? `${rule.scope} only` : others ? `+${others} scoped ${others === 1 ? 'rule' : 'rules'} in Advanced` : null
+    return {
+      tool,
+      ability: rule?.ability ?? abilityFor(tool),
+      decision: rule?.decision ?? config.defaultDecision,
+      isDefault: !rule,
+      // A rule with no name can't be changed here (rules are changed by name).
+      editable: !rule || Boolean(rule.name),
+      scopeNote,
+    }
+  })
+  return { ...config, rules, tools }
+}
+
+// The Permissions tab's switch for one tool: updates its rule for everyone
+// (*/*), or adds one (tool-<name>) when it has none.
+async function handleActauthToolPut(req: IncomingMessage, res: ServerResponse, agentName: string, tool: string): Promise<void> {
   if (!getEntry(agentName)) {
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
     return
   }
-  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(readActauthConfig(agentName)))
+  const body = await readJsonBody(req)
+  if (!isDecision(body.decision)) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: "decision must be 'allow', 'ask', or 'deny'" }))
+    return
+  }
+  const { rules } = readActauthConfig(agentName)
+  const existing = rules.find((r) => r.tool === tool && r.scope === '*/*' && r.name)
+  try {
+    if (existing) {
+      updateActauthRule(agentName, existing.name!, { scope: existing.scope, tool, decision: body.decision })
+    } else {
+      const base = `tool-${tool}`.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').slice(0, 80)
+      let name = base
+      for (let i = 2; rules.some((r) => r.name === name); i++) name = `${base}-${i}`
+      addActauthRule(agentName, { name, scope: '*/*', tool, decision: body.decision })
+    }
+  } catch (err) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await actauthConfigWithAbilities(agentName)))
+}
+
+async function handleActauthGet(res: ServerResponse, agentName: string): Promise<void> {
+  if (!getEntry(agentName)) {
+    res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
+    return
+  }
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await actauthConfigWithAbilities(agentName)))
 }
 
 async function handleActauthRulePost(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
@@ -1812,7 +1966,7 @@ async function handleActauthRulePost(req: IncomingMessage, res: ServerResponse, 
     res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
     return
   }
-  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(readActauthConfig(agentName)))
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await actauthConfigWithAbilities(agentName)))
 }
 
 async function handleActauthRulePut(req: IncomingMessage, res: ServerResponse, agentName: string, ruleName: string): Promise<void> {
@@ -1833,10 +1987,10 @@ async function handleActauthRulePut(req: IncomingMessage, res: ServerResponse, a
     res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
     return
   }
-  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(readActauthConfig(agentName)))
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await actauthConfigWithAbilities(agentName)))
 }
 
-function handleActauthRuleDelete(res: ServerResponse, agentName: string, ruleName: string): void {
+async function handleActauthRuleDelete(res: ServerResponse, agentName: string, ruleName: string): Promise<void> {
   if (!getEntry(agentName)) {
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
     return
@@ -1848,7 +2002,7 @@ function handleActauthRuleDelete(res: ServerResponse, agentName: string, ruleNam
     res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
     return
   }
-  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(readActauthConfig(agentName)))
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await actauthConfigWithAbilities(agentName)))
 }
 
 async function handleActauthDefaultDecisionPut(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
@@ -1862,7 +2016,7 @@ async function handleActauthDefaultDecisionPut(req: IncomingMessage, res: Server
     return
   }
   setDefaultDecision(agentName, body.decision)
-  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(readActauthConfig(agentName)))
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await actauthConfigWithAbilities(agentName)))
 }
 
 // GET /agents content-negotiates on this: a browser navigating there sends
@@ -3416,6 +3570,19 @@ const server = createServer(async (req, res) => {
       )
       return
     }
+    // The model dropdown in the New agent and Model forms: what the
+    // provider lists for the saved key. Never includes the key itself.
+    const providerModelsMatch = req.method === 'GET' && pathname.match(/^\/config\/models\/([a-z]+)\/models$/)
+    if (providerModelsMatch) {
+      try {
+        const view = await listProviderModels(providerModelsMatch[1])
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(view))
+      } catch (err) {
+        const status = err instanceof ModelKeyError ? 400 : 500
+        res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+      }
+      return
+    }
     // A provider's API key, from the Models page: write-only, never read
     // back. Same rule as the Environment tab: refused on a server with no
     // auth, since anyone who could reach it could replace the key.
@@ -3608,12 +3775,17 @@ const server = createServer(async (req, res) => {
       return
     }
     if (notifierMatch && req.method === 'DELETE') {
-      handleNotifierDelete(res, decodeURIComponent(notifierMatch[1]))
+      handleNotifierDelete(res, decodeURIComponent(notifierMatch[1]), new URL(req.url ?? '/', 'http://localhost').searchParams.get('channel') ?? undefined)
       return
     }
     const notifierTestMatch = req.method === 'POST' && pathname.match(/^\/agents\/([^/]+)\/notifier\/test$/)
     if (notifierTestMatch) {
-      await handleNotifierTest(res, decodeURIComponent(notifierTestMatch[1]))
+      await handleNotifierTest(req, res, decodeURIComponent(notifierTestMatch[1]))
+      return
+    }
+    const notifierPrimaryMatch = req.method === 'PUT' && pathname.match(/^\/agents\/([^/]+)\/notifier\/primary$/)
+    if (notifierPrimaryMatch) {
+      await handleNotifierPrimaryPut(req, res, decodeURIComponent(notifierPrimaryMatch[1]))
       return
     }
     // Backs the console's Schedules tab — see handleSchedulesGet above.
@@ -3683,6 +3855,105 @@ const server = createServer(async (req, res) => {
     // itself need to be excluded from matching as an agent name (it
     // never would be one in practice, but this ordering means never
     // having to think about it).
+    // Private ability sources (Settings) and what they offer (the
+    // Abilities page's Private section): web/ability-sources-admin.ts.
+    // Saving or removing one stores a token, so it's refused without auth,
+    // like a model key.
+    if (pathname === '/config/ability-sources' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ...describeAbilitySources(), canSave: secretsProtected }))
+      return
+    }
+    const abilitySourceMatch = pathname.match(/^\/config\/ability-sources(?:\/([a-z0-9-]+))?$/)
+    if (abilitySourceMatch && (req.method === 'PUT' || req.method === 'DELETE')) {
+      if (!secretsProtected) {
+        res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Refusing to change ability sources without LOOPENGINE_ADMIN_AUTH configured: set it first, or edit ability-sources.yml and .env.' }))
+        return
+      }
+      try {
+        if (req.method === 'PUT') await saveAbilitySourceFromConsole(await readJsonBody(req))
+        else if (abilitySourceMatch[1]) await removeAbilitySourceFromConsole(abilitySourceMatch[1])
+        else throw new AbilitySourceError('Name the source to remove')
+      } catch (err) {
+        const status = err instanceof AbilitySourceError ? 400 : 500
+        res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ...describeAbilitySources(), canSave: secretsProtected }))
+      return
+    }
+    // What an ability can do: its tools (what each does, its permission)
+    // and skills. `agent` adds that agent's current decisions.
+    if (pathname === '/abilities/details' && req.method === 'GET') {
+      const params = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const spec = params.get('spec')?.trim()
+      const agent = params.get('agent') ?? undefined
+      if (!spec || (agent && !getEntry(agent))) {
+        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: spec ? `unknown agent '${agent}'` : 'spec is required' }))
+        return
+      }
+      try {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(await abilityDetails(spec, { agent })))
+      } catch (err) {
+        res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+      }
+      return
+    }
+    // The workspace's private abilities (core/workspace-abilities.ts):
+    // installed from the Abilities page, added to agents from their tab.
+    if (pathname === '/abilities/workspace' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ abilities: listWorkspaceAbilities() }))
+      return
+    }
+    if (pathname === '/abilities/workspace' && (req.method === 'POST' || req.method === 'DELETE')) {
+      try {
+        if (req.method === 'POST') {
+          const spec = (await readJsonBody(req)).spec
+          if (typeof spec !== 'string' || !spec.trim()) throw new WorkspaceAbilityError('spec is required')
+          await installWorkspaceAbility(spec.trim())
+        } else {
+          removeWorkspaceAbility(new URL(req.url ?? '/', 'http://localhost').searchParams.get('name') ?? '')
+        }
+      } catch (err) {
+        const status = err instanceof WorkspaceAbilityError ? 400 : 502
+        res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ abilities: listWorkspaceAbilities() }))
+      return
+    }
+    // An ability uploaded from the browser (a .zip/.tgz, or a folder's
+    // files, base64), stored in the workspace like one from a source.
+    if (pathname === '/abilities/workspace/upload' && req.method === 'POST') {
+      try {
+        // Base64 adds a third, plus the JSON around it.
+        const body = await readLimitedJsonBody(req, Math.ceil(MAX_UPLOAD_BYTES * 1.4) + 64 * 1024)
+        const upload: AbilityUpload =
+          body.kind === 'files' && Array.isArray(body.files)
+            ? { kind: 'files', folderName: typeof body.folderName === 'string' ? body.folderName : undefined, files: (body.files as Array<{ path?: unknown; data?: unknown }>).map((f) => ({ path: String(f?.path ?? ''), data: String(f?.data ?? '') })) }
+            : { kind: 'archive', fileName: String(body.fileName ?? ''), data: String(body.data ?? '') }
+        await installUploadedAbility(upload)
+      } catch (err) {
+        const status = err instanceof WorkspaceAbilityError ? 400 : 500
+        res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ abilities: listWorkspaceAbilities() }))
+      return
+    }
+    // Public abilities on npm, for the Abilities page (no agent involved).
+    if (pathname === '/abilities/search' && req.method === 'GET') {
+      try {
+        const results = await searchPublicAbilities(new URL(req.url ?? '/', 'http://localhost').searchParams.get('q') ?? undefined)
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ results }))
+      } catch (err) {
+        res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+      }
+      return
+    }
+    if (pathname === '/abilities/private' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(await listPrivateAbilities()))
+      return
+    }
     const abilitiesSearchMatch = pathname.match(/^\/agents\/([^/]+)\/abilities\/search$/)
     if (abilitiesSearchMatch && req.method === 'GET') {
       const query = new URL(req.url ?? '/', 'http://localhost').searchParams.get('q')
@@ -3729,13 +4000,19 @@ const server = createServer(async (req, res) => {
       return
     }
 
+    const actauthToolMatch = req.method === 'PUT' && pathname.match(/^\/agents\/([^/]+)\/actauth\/tools\/([^/]+)$/)
+    if (actauthToolMatch) {
+      await handleActauthToolPut(req, res, decodeURIComponent(actauthToolMatch[1]), decodeURIComponent(actauthToolMatch[2]))
+      return
+    }
+
     const actauthRuleMatch = pathname.match(/^\/agents\/([^/]+)\/actauth\/rules\/([^/]+)$/)
     if (actauthRuleMatch && req.method === 'PUT') {
       await handleActauthRulePut(req, res, decodeURIComponent(actauthRuleMatch[1]), decodeURIComponent(actauthRuleMatch[2]))
       return
     }
     if (actauthRuleMatch && req.method === 'DELETE') {
-      handleActauthRuleDelete(res, decodeURIComponent(actauthRuleMatch[1]), decodeURIComponent(actauthRuleMatch[2]))
+      await handleActauthRuleDelete(res, decodeURIComponent(actauthRuleMatch[1]), decodeURIComponent(actauthRuleMatch[2]))
       return
     }
 
@@ -3747,7 +4024,7 @@ const server = createServer(async (req, res) => {
 
     const actauthMatch = req.method === 'GET' && pathname.match(/^\/agents\/([^/]+)\/actauth$/)
     if (actauthMatch) {
-      handleActauthGet(res, decodeURIComponent(actauthMatch[1]))
+      await handleActauthGet(res, decodeURIComponent(actauthMatch[1]))
       return
     }
 
