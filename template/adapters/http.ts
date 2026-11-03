@@ -29,7 +29,7 @@
 // file's call — see AgentConfig.sessionIdFor and defaultSessionIdFor below.
 import { execFile } from 'node:child_process'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { createReadStream, existsSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, rmSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { extname, join, resolve as resolvePath, sep } from 'node:path'
@@ -183,6 +183,7 @@ import {
   removeAbility,
   listInstalledAbilities,
   backfillDependencies,
+  configureAgentMcpTools,
   AbilityAlreadyInstalledError,
   AbilityCollisionError,
   AbilityManifestError,
@@ -204,14 +205,35 @@ import {
   runWorkflowNow,
   startPlanJob,
   type WorkflowAgentInfo,
+  type WorkflowMcpDeps,
   workflowPageHtml,
   MAX_UPLOAD_BYTES,
   installUploadedAbility,
   installWorkspaceAbility,
   type AbilityUpload,
   WorkspaceAbilityError,
+  addWorkspaceAbility,
   listWorkspaceAbilities,
   removeWorkspaceAbility,
+  getMcpServer,
+  searchMcpServers,
+  isMcpAuthError,
+  listMcpServerTools,
+  resolveMcpManifest,
+  McpAbilityGenerationError,
+  generateMcpAbility,
+  mcpAbilityNames,
+  readAbilityDetails,
+  AppToolsError,
+  appCatalog,
+  appServer,
+  appTools,
+  connectedApps,
+  isAppAbility,
+  loadAppIcons,
+  refreshAppTools,
+  setAppDefault,
+  type AgentAppTools,
   AbilitySourceError,
   abilityOrigin,
   readAbilitySources,
@@ -532,7 +554,7 @@ async function describeAgent(entry: RegistryEntry): Promise<Record<string, unkno
     skillIndexBudgetTokens: config.skillIndexBudgetTokens ?? 2000,
     skillsDirs: skillsDirs,
     // How many abilities are installed — just the count, for the console's
-    // tab badge; the Abilities tab's own GET .../abilities has the detail
+    // tab badge; the Apps tab's own GET .../abilities has the detail
     // (and its slower npm version lookups).
     abilityCount: listInstalledAbilities(config.name).length,
     skills: skillIndex.map((s) => ({ name: s.name, description: s.description })),
@@ -1067,6 +1089,228 @@ async function workflowAgentInfo(): Promise<WorkflowAgentInfo[]> {
   )
 }
 
+// Steps no ability can do can use an app's MCP server
+// (core/mcp-directory.ts), made into a private ability on Create.
+const workflowMcp: WorkflowMcpDeps = {
+  getServer: getMcpServer,
+  // The workspace ability already using the server at `url`.
+  existingFor(url) {
+    for (const found of listWorkspaceAbilities()) {
+      try {
+        const manifest = JSON.parse(readFileSync(join(found.spec.replace(/^file:/, ''), 'loopengine.ability.json'), 'utf8')) as { mcp?: { url?: string } }
+        if (found.source !== `mcp:${url}` && manifest.mcp?.url !== url) continue
+        return { spec: found.spec, tools: resolveMcpManifest(found.name, manifest.mcp).tools }
+      } catch {}
+    }
+    return undefined
+  },
+  keyValue: (name) => process.env[name],
+}
+
+/** A server's tools for the planner, or why they can't be seen yet. */
+async function workflowMcpServerTools(id: string): Promise<unknown> {
+  const server = await getMcpServer(id)
+  if (!server) return `No MCP server ${id}.`
+  const { keyEnv } = mcpAbilityNames(server)
+  const key = process.env[keyEnv]
+  try {
+    const tools = await listMcpServerTools(
+      { url: server.url, ...(server.transport === 'sse' ? { transport: 'sse' as const } : {}), auth: key ? { type: 'key', env: keyEnv, ...(server.auth ?? {}) } : { type: 'none' } },
+      { get: (n) => (n === keyEnv ? key : undefined), require: (n) => { if (n === keyEnv && key) return key; throw new Error(`${n} is not set`) } },
+    )
+    return { server: server.title, tools: tools.slice(0, 80).map((t) => ({ name: t.name, description: t.description.split('\n')[0].slice(0, 200), ...(t.readOnly !== undefined ? { readOnly: t.readOnly } : {}) })) }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return isMcpAuthError(err)
+      ? `${server.title} needs a key before its tools can be seen. Plan its steps by what they do (leave "tool" empty); the person adds the key on the plan, and its tools are picked on Create.`
+      : `Couldn't reach ${server.title}: ${message.slice(0, 200)}`
+  }
+}
+
+/** Each agent's tools from the app `abilityName`, with the permission
+ * each has there (its first rule for the tool). */
+function agentAppTools(abilityName: string): AgentAppTools {
+  const out: AgentAppTools = {}
+  for (const agent of listAgents()) {
+    let record: ReturnType<typeof listInstalledAbilities>[number] | undefined
+    try {
+      record = listInstalledAbilities(agent).find((a) => a.name === abilityName && a.mcp)
+    } catch {}
+    if (!record?.mcp) continue
+    const rules = readActauthConfig(agent).rules
+    const decided = (d: unknown): d is 'allow' | 'ask' | 'deny' => d === 'allow' || d === 'ask' || d === 'deny'
+    out[agent] = record.mcp.tools.map((t) => {
+      const d = rules.find((r) => r.tool === t.name)?.decision
+      return { remote: t.remote, decision: decided(d) ? d : 'ask' }
+    })
+  }
+  return out
+}
+
+/** Adds more of an app's tools to an agent that has it, each at the
+ * app's default permission, keeping the agent's current ones. */
+function addAgentAppTools(agent: string, spec: string, tools: string[]): void {
+  const dir = spec.replace(/^file:/, '')
+  const name = (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name: string }).name
+  const current = agentAppTools(name)[agent] ?? []
+  const defaults = readAbilityDetails(dir).tools
+  const manifest = JSON.parse(readFileSync(join(dir, 'loopengine.ability.json'), 'utf8')) as { mcp?: unknown }
+  const all = resolveMcpManifest(name, manifest.mcp).tools
+  const choice = [...current]
+  for (const remote of tools) {
+    if (choice.some((c) => c.remote === remote)) continue
+    const installed = all.find((t) => t.remote === remote)?.name
+    const d = defaults.find((t) => t.name === installed)?.decision
+    choice.push({ remote, decision: d === 'allow' || d === 'deny' ? d : 'ask' })
+  }
+  configureAgentMcpTools(agent, name, dir, choice)
+}
+
+/** For a template or workflow: the connected app's workspace spec, or
+ * undefined when it isn't connected. Its tools are chosen at install. */
+async function prepareWorkspaceApp(id: string): Promise<string | undefined> {
+  const server = await appServer(id)
+  return describeApps().connected.find((c) => c.id === id || (server && c.url === server.url))?.spec
+}
+
+function describeApps(): { apps: ReturnType<typeof appCatalog>; connected: ReturnType<typeof connectedApps>; canConnect: boolean } {
+  const agentAbilities: Record<string, string[]> = {}
+  for (const name of listAgents()) {
+    try {
+      agentAbilities[name] = listInstalledAbilities(name).map((a) => a.name)
+    } catch {}
+  }
+  const connected = connectedApps(listWorkspaceAbilities(), agentAbilities, (name) => process.env[name])
+  return { apps: appCatalog(connected), connected, canConnect: secretsProtected }
+}
+
+async function handleAgentApp(req: IncomingMessage, res: ServerResponse, agent: string, ability: string): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+  }
+  try {
+    if (!getEntry(agent)) return json(404, { error: `unknown agent '${agent}'` })
+    const app = describeApps().connected.find((c) => c.ability === ability)
+    if (!app) return json(400, { error: 'That app isn\'t connected.' })
+    const dir = app.spec.replace(/^file:/, '')
+    const envValue = (name: string) => process.env[name]
+    const view = async () => {
+      const mine = agentAppTools(ability)[agent]
+      const all = await appTools(app.spec, envValue, {})
+      return {
+        app: { title: app.title, ability },
+        installed: Boolean(mine),
+        tools: all.map((t) => {
+          const chosen = mine?.find((m) => m.remote === t.remote)
+          return { remote: t.remote, name: t.name, description: t.description, ...(t.readOnly !== undefined ? { readOnly: t.readOnly } : {}), ...(t.destructive ? { destructive: true } : {}), default: t.decision, selected: Boolean(chosen), decision: chosen?.decision ?? t.decision }
+        }),
+      }
+    }
+    if (req.method === 'GET') return json(200, await view())
+    if (req.method !== 'PUT') return json(404, { error: 'not found' })
+    if (!secretsProtected) return json(403, { error: 'Changing an agent\'s tools needs LOOPENGINE_ADMIN_AUTH set first.' })
+    const body = await readJsonBody(req)
+    const decided = (d: unknown): d is 'allow' | 'ask' | 'deny' => d === 'allow' || d === 'ask' || d === 'deny'
+    const choice = (Array.isArray(body.tools) ? body.tools : []).flatMap((t: unknown) => {
+      const e = (t ?? {}) as { remote?: unknown; decision?: unknown }
+      return typeof e.remote === 'string' && decided(e.decision) ? [{ remote: e.remote, decision: e.decision }] : []
+    })
+    if (!choice.length) return json(400, { error: 'Choose at least one tool, or remove the app from the agent instead.' })
+    if (agentAppTools(ability)[agent]) configureAgentMcpTools(agent, ability, dir, choice)
+    else await installAbility(agent, app.spec, { mcpTools: choice.map((c) => c.remote), mcpDecisions: Object.fromEntries(choice.map((c) => [c.remote, c.decision])) })
+    return json(200, await view())
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (err instanceof AbilityManifestError || err instanceof AbilityCollisionError || err instanceof AppToolsError) return json(400, { error: message })
+    console.error('[loopengine] agent app failed:', err)
+    return json(502, { error: message })
+  }
+}
+
+async function handleApps(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+  }
+  try {
+    if (pathname === '/config/apps' && req.method === 'GET') {
+      // Icons arrive from the registry on a first load; wait briefly.
+      await Promise.race([loadAppIcons(), new Promise((resolve) => setTimeout(resolve, 2500))])
+      return json(200, describeApps())
+    }
+    if (pathname === '/config/apps/search' && req.method === 'GET') {
+      const q = new URL(req.url ?? '/', 'http://localhost').searchParams.get('q')?.trim() ?? ''
+      if (q.length < 2) return json(400, { error: 'Type at least two letters.' })
+      return json(200, { servers: await searchMcpServers(q, 15) })
+    }
+    if (pathname === '/config/apps/connect' && req.method === 'POST') {
+      if (!secretsProtected) return json(403, { error: 'Connecting an app saves its key on this server, so it needs LOOPENGINE_ADMIN_AUTH set first.' })
+      const body = await readJsonBody(req)
+      const id = typeof body.id === 'string' ? body.id.trim() : ''
+      const key = typeof body.key === 'string' ? body.key.trim() : ''
+      const server = id ? await appServer(id) : undefined
+      if (!server) return json(400, { error: 'No such app.' })
+      let picked: ReturnType<typeof pickInterviewModel>
+      try {
+        picked = pickInterviewModel(interviewAgents())
+      } catch {
+        picked = undefined
+      }
+      const generated = await generateMcpAbility({
+        server,
+        ...(key ? { key } : {}),
+        workflow: { name: `${server.title} for this workspace`, summary: `Everyday work with ${server.title}`, steps: [] },
+        ...(picked ? { modelCall: picked.modelCall } : {}),
+      })
+      try {
+        addWorkspaceAbility(generated.dir, `mcp:${server.url}`)
+      } finally {
+        rmSync(generated.dir, { recursive: true, force: true })
+      }
+      if (key && generated.keyEnv) await setEnvVar(generated.keyEnv, key)
+      return json(200, { ...describeApps(), connectedAbility: generated.name })
+    }
+    // A connected app's tools: everything its server offers, each with
+    // its default permission and the agents that use it. Defaults only
+    // affect agents that add a tool from now on.
+    if (pathname === '/config/apps/tools' || pathname === '/config/apps/refresh') {
+      const params = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const body = req.method === 'POST' ? await readJsonBody(req) : {}
+      const ability = String(req.method === 'POST' ? body.ability ?? '' : params.get('ability') ?? '')
+      const app = listWorkspaceAbilities().find((a) => a.name === ability && isAppAbility(a))
+      if (!app) return json(400, { error: 'That app isn\'t connected.' })
+      const envValue = (name: string) => process.env[name]
+      const list = async (fresh = false) => appTools(app.spec, envValue, agentAppTools(app.name), { fresh })
+      if (req.method === 'GET') return json(200, { tools: await list(params.get('fresh') === '1') })
+      if (req.method !== 'POST') return json(404, { error: 'not found' })
+      if (!secretsProtected) return json(403, { error: 'Changing an app needs LOOPENGINE_ADMIN_AUTH set first.' })
+      if (pathname === '/config/apps/refresh') {
+        const changed = await refreshAppTools(app.spec, envValue)
+        return json(200, { tools: await list(), ...changed, ...describeApps() })
+      }
+      const tool = typeof body.tool === 'string' ? body.tool : ''
+      const decision = body.decision === 'allow' || body.decision === 'ask' || body.decision === 'deny' ? body.decision : undefined
+      if (!tool || !decision) return json(400, { error: 'tool and decision are required' })
+      setAppDefault(app.spec, tool, decision)
+      return json(200, { tools: await list() })
+    }
+    if (pathname === '/config/apps/connect' && req.method === 'DELETE') {
+      if (!secretsProtected) return json(403, { error: 'Disconnecting an app needs LOOPENGINE_ADMIN_AUTH set first.' })
+      const ability = new URL(req.url ?? '/', 'http://localhost').searchParams.get('ability') ?? ''
+      const found = listWorkspaceAbilities().find((a) => a.name === ability && isAppAbility(a))
+      if (!found) return json(400, { error: 'That app isn\'t connected.' })
+      removeWorkspaceAbility(found.name)
+      return json(200, describeApps())
+    }
+    return json(404, { error: 'not found' })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (err instanceof McpAbilityGenerationError || err instanceof WorkspaceAbilityError || err instanceof AppToolsError) return json(400, { error: message })
+    if (isMcpAuthError(err)) return json(400, { error: 'The app turned down its saved key; reconnect it with a new one.' })
+    console.error('[loopengine] apps failed:', err)
+    return json(502, { error: message })
+  }
+}
+
 async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
   const json = (status: number, body: unknown): void => {
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
@@ -1121,6 +1365,9 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
           return { name: d.name, tools: d.tools.map((t) => ({ name: t.name, description: t.description.slice(0, 300), decision: t.decision ?? null })), settings: d.settings.map((x) => x.name) }
         },
         listConnections: () => base.listConnections(),
+        searchMcpServers: async (query) => (await searchMcpServers(query)).map((s) => ({ id: s.id, title: s.title, description: s.description, url: s.url, official: Boolean(s.official), verified: s.verified, source: s.source })),
+        mcpServerTools: workflowMcpServerTools,
+        mcp: workflowMcp,
       }))
       return json(202, job)
     }
@@ -1128,6 +1375,23 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
       const body = await readJsonBody(req)
       const model = pickAgentModel(interviewAgents())
       const created = await createWorkflow(body, {
+        addAppTools: async (agent, spec, tools) => addAgentAppTools(agent, spec, tools),
+        mcp: {
+          ...workflowMcp,
+          // The planning model picks the server's tools and writes the skill.
+          generate: (request) => generateMcpAbility({ ...request, ...(picked ? { modelCall: picked.modelCall } : {}) }),
+          store: (dir, source) => {
+            try {
+              return addWorkspaceAbility(dir, source).spec
+            } finally {
+              rmSync(dir, { recursive: true, force: true })
+            }
+          },
+          saveKey: async (name, value) => {
+            if (!secretsProtected) throw new Error('saving keys needs LOOPENGINE_ADMIN_AUTH set on the server')
+            await setEnvVar(name, value)
+          },
+        },
         agentExists: (name) => Boolean(getEntry(name)) || existsSync(dirOf(name)),
         agentDir: dirOf,
         agentInfo: workflowAgentInfo,
@@ -1148,9 +1412,10 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
           const indexPath = join(dirOf(name), 'index.ts')
           registerAgent(await loadAgentModule(indexPath, indexPath))
         },
-        // As for templates and the Abilities tab: installing runs
+        // As for templates and the Apps tab: installing runs
         // third-party code, so only behind the admin login.
-        ...(secretsProtected ? { installAbility: async (name: string, spec: string) => void (await installAbility(name, spec)) } : {}),
+        ...(secretsProtected ? { installAbility: async (name: string, spec: string, options?: { mcpTools?: string[] }) => void (await installAbility(name, spec, options ?? {})) } : {}),
+        prepareApp: prepareWorkspaceApp,
         envValue: (name, variable) => createAgentEnv(name, dirOf(name)).get(variable),
         messagingConfigured: (name) => {
           const entry = getEntry(name)
@@ -1224,10 +1489,11 @@ async function handleStarterTemplates(req: IncomingMessage, res: ServerResponse,
           const indexPath = join(dirOf(name), 'index.ts')
           registerAgent(await loadAgentModule(indexPath, indexPath))
         },
-        // Same rule as the Abilities tab: installing runs third-party code,
+        // Same rule as the Apps tab: installing runs third-party code,
         // so only behind the admin login. The agent isn't loaded yet, so
         // nothing needs a restart.
-        ...(secretsProtected ? { installAbility: async (name: string, spec: string) => void (await installAbility(name, spec)) } : {}),
+        ...(secretsProtected ? { installAbility: async (name: string, spec: string, options?: { mcpTools?: string[] }) => void (await installAbility(name, spec, options ?? {})) } : {}),
+        prepareApp: prepareWorkspaceApp,
         envValue,
         messagingConfigured: (name) => {
           const entry = getEntry(name)
@@ -1821,7 +2087,7 @@ function hasNodeModule(name: string): boolean {
   return existsSync(join(process.cwd(), 'node_modules', name))
 }
 
-// Backs the Admin UI's Abilities tab list — everything currently
+// Backs the Admin UI's Apps tab list — everything currently
 // installed for this agent, each annotated with the latest version
 // currently published on the public npm registry (fetchLatestAbilityVersion,
 // best-effort — null for a private/file:/git-installed ability, or on any
@@ -1861,7 +2127,7 @@ async function handleAbilitiesGet(res: ServerResponse, agentName: string): Promi
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ abilities }))
 }
 
-// Backs the Abilities tab's search box — proxies to npm's own public
+// Backs the Apps tab's search box — proxies to npm's own public
 // registry search (loopengine's own searchPublicAbilities) so the
 // browser never needs direct access to registry.npmjs.org, and the
 // actual query text (the loopengine-ability keyword filter) stays a
@@ -3676,6 +3942,13 @@ const server = createServer(async (req, res) => {
       await handleWorkflows(req, res, pathname)
       return
     }
+    // An agent's tools from one connected app: which it has, and each
+    // one's permission for this agent (the Apps tab's app picker).
+    const agentAppMatch = pathname.match(/^\/agents\/([^/]+)\/apps\/([^/]+)$/)
+    if (agentAppMatch) {
+      await handleAgentApp(req, res, decodeURIComponent(agentAppMatch[1]), decodeURIComponent(agentAppMatch[2]))
+      return
+    }
     const agentWorkflowsMatch = pathname.match(/^\/agents\/([^/]+)\/workflows(?:\/([a-z0-9-]+))?(?:\/(run))?$/)
     if (agentWorkflowsMatch) {
       await handleAgentWorkflows(req, res, decodeURIComponent(agentWorkflowsMatch[1]), agentWorkflowsMatch[2], agentWorkflowsMatch[3])
@@ -4041,7 +4314,7 @@ const server = createServer(async (req, res) => {
       return
     }
 
-    // Backs the Admin UI's Abilities tab — see handleAbilitiesGet/
+    // Backs the Admin UI's Apps tab — see handleAbilitiesGet/
     // handleAbilitiesSearchGet/handleAbilityInstallPost's own doc
     // comments above. The /search route is checked before the plain
     // :agentName routes right below since 'search' would otherwise
@@ -4091,10 +4364,17 @@ const server = createServer(async (req, res) => {
       }
       return
     }
+    // The workspace's Apps (core/mcp-apps.ts): popular apps' MCP servers,
+    // and the ones connected. Connecting stores a key and makes a
+    // workspace ability, so like installing one it needs the admin login.
+    if (pathname.startsWith('/config/apps')) {
+      await handleApps(req, res, pathname)
+      return
+    }
     // The workspace's private abilities (core/workspace-abilities.ts):
     // installed from the Abilities page, added to agents from their tab.
     if (pathname === '/abilities/workspace' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ abilities: listWorkspaceAbilities() }))
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ abilities: listWorkspaceAbilities().map((a) => ({ ...a, app: isAppAbility(a) })) }))
       return
     }
     if (pathname === '/abilities/workspace' && (req.method === 'POST' || req.method === 'DELETE')) {
