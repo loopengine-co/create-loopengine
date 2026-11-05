@@ -139,6 +139,7 @@ import {
   pauseScheduledTask,
   resumeScheduledTask,
   runScheduledTaskNow,
+  setScheduledTaskNotify,
   type ScheduledTask,
   type ScheduledTaskRun,
   listAgentPending,
@@ -201,9 +202,11 @@ import {
   forgetWorkflow,
   getPlanJob,
   listAgentWorkflows,
+  migrateAgentWorkflows,
   planWorkflow,
-  runWorkflowNow,
+  prepareWorkflowRun,
   startPlanJob,
+  updateWorkflow,
   type WorkflowAgentInfo,
   type WorkflowMcpDeps,
   workflowPageHtml,
@@ -273,6 +276,38 @@ import {
   createScheduleTools,
   type PendingQuestion,
   WebhookNotifier,
+  // Workflows (skills with a start message), their runs, run callbacks
+  // and webhook triggers.
+  WorkflowParamsError,
+  readWorkflow,
+  readWorkflows,
+  validateParams,
+  workflowRunMessage,
+  WorkflowRunner,
+  getRun,
+  getRunStore,
+  listRuns,
+  type WorkflowRun,
+  CallbackUrlError,
+  callbackSecret,
+  checkCallbackUrl,
+  deliverCallback,
+  runCallbackPayload,
+  type RunCallbackEvent,
+  TriggerError,
+  createTrigger,
+  deliveryId,
+  findTriggerByToken,
+  getTriggerStore,
+  listTriggers,
+  paramsFromPayload,
+  parsePayload,
+  passesFilter,
+  publicTrigger,
+  recordTriggerDelivery as recordDelivery,
+  rotateTrigger,
+  updateTrigger,
+  verifySenderSignature,
 } from 'loopengine'
 import { SkillGarden } from 'loopengine'
 import type { Decision, PendingApproval } from 'actauth'
@@ -365,6 +400,27 @@ function readRawBody(req: IncomingMessage): Promise<string> {
     let data = ''
     req.on('data', (chunk) => (data += chunk))
     req.on('end', () => resolve(data))
+    req.on('error', reject)
+  })
+}
+
+/** The raw request body, refused past `maxBytes` (null then). */
+function readLimitedRawBuffer(req: IncomingMessage, maxBytes: number): Promise<Buffer | null> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    let over = false
+    req.on('data', (chunk: Buffer) => {
+      if (over) return
+      size += chunk.length
+      if (size > maxBytes) {
+        over = true
+        resolve(null)
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => { if (!over) resolve(Buffer.concat(chunks)) })
     req.on('error', reject)
   })
 }
@@ -563,7 +619,7 @@ async function describeAgent(entry: RegistryEntry): Promise<Record<string, unkno
     // createAskUserTool() with no onPending, purely to describe its
     // schema here — never executed, so the console-prompt fallback its
     // own doc comment mentions never applies to this call.
-    systemTools: [...systemTools, createAskUserTool({ agent: config.name }), ...(config.selfScheduling === false ? [] : createScheduleTools(config.name))].map(describeTool),
+    systemTools: [...systemTools, createAskUserTool({ agent: config.name }), ...(config.selfScheduling === false ? [] : createScheduleTools(config.name, { agentDir: agentDirFor(config) }))].map(describeTool),
     localTools: localTools.map((t) => ({ ...describeTool(t), httpToolEditable: editableHttpToolNames.has(t.name) })),
     agentAsTools: agentAsTools.map(describeTool),
     gatewayTools: gatewayTools.map(describeTool),
@@ -1437,7 +1493,28 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
   }
 }
 
-// An agent's workflows (its Overview): list, run now, forget.
+// How long POST .../workflows/:id/run with "wait": true waits for the run
+// before answering 202 with its runId (look it up later with GET
+// /agents/:name/runs/:runId); under the 90 s an ingress allows.
+const WORKFLOW_WAIT_MS = Number(process.env.LOOPENGINE_WORKFLOW_WAIT_MS) || 85_000
+
+// An agent's workflows (its Overview, and apps over the API): list, run
+// now with parameters, edit how runs start (PUT), forget.
+//
+//   POST /agents/:name/workflows/:id/run
+//     { "params": {…}, "wait": true, "notify": true, "callback_url": "https://…" }
+//
+// "notify" sends the result through the agent's messaging connection when
+// the run ends; "callback_url" gets the run's record posted to it when it
+// ends or stops for a decision, signed (core/run-callbacks.ts). Both are
+// optional, and work with or without "wait".
+//
+// starts a one-off run. Without "wait" it answers 202 { runId } straight
+// away. With it, 200 { runId, text } once the run finishes, 202 { runId,
+// pending: true } if it stops for an approval or a question, or 202
+// { runId, running: true } if it's still going after WORKFLOW_WAIT_MS.
+// A failed run answers 502 { runId, error }. Wrong or missing params are
+// a 400 before anything runs.
 async function handleAgentWorkflows(req: IncomingMessage, res: ServerResponse, agentName: string, id: string | undefined, action: string | undefined): Promise<void> {
   const json = (status: number, body: unknown): void => {
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
@@ -1446,15 +1523,46 @@ async function handleAgentWorkflows(req: IncomingMessage, res: ServerResponse, a
   const dir = agentDir(agentName)
   try {
     if (!id && req.method === 'GET') return json(200, { workflows: await listAgentWorkflows(agentName, dir) })
-    if (id && action === 'run' && req.method === 'POST') return json(200, await runWorkflowNow(agentName, dir, id))
-    if (id && !action && req.method === 'DELETE') {
-      forgetWorkflow(dir, id)
+    if (id && action === 'runs' && req.method === 'GET') return json(200, { runs: await listRuns(agentName, { workflowId: id, limit: 50 }) })
+    if (id && action === 'run' && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      if (body.notify !== undefined && typeof body.notify !== 'boolean') return json(400, { error: 'notify must be true or false' })
+      let callbackUrl: string | undefined
+      if (body.callback_url !== undefined && body.callback_url !== null && body.callback_url !== '') {
+        try {
+          callbackUrl = checkCallbackUrl(body.callback_url)
+        } catch (err) {
+          return json(400, { error: err instanceof CallbackUrlError ? err.message : String(err) })
+        }
+      }
+      const prepared = await prepareWorkflowRun(agentName, dir, id, body.params)
+      const run = await workflowRunner.start({
+        agent: agentName, workflow_id: id, params: prepared.params, source: body.source === 'console' ? 'console' : 'api', message: prepared.message,
+        ...(body.notify === true ? { notify: true } : {}), ...(callbackUrl ? { callback_url: callbackUrl } : {}),
+      })
+      if (body.wait !== true) return json(202, { runId: run.run_id })
+      const deadline = Date.now() + WORKFLOW_WAIT_MS
+      for (;;) {
+        const current = await getRun(agentName, run.run_id)
+        if (current?.status === 'awaiting_approval') return json(202, { runId: run.run_id, pending: true })
+        if (current?.status === 'done') return json(200, { runId: run.run_id, text: current.result ?? '' })
+        if (current?.status === 'error') return json(502, { runId: run.run_id, error: current.error ?? 'The run failed.' })
+        if (Date.now() >= deadline) return json(202, { runId: run.run_id, running: true })
+        await new Promise((r) => setTimeout(r, 300))
+      }
+    }
+    if (id && !action && req.method === 'PUT') {
+      updateWorkflow(dir, id, await readJsonBody(req))
       return json(200, { workflows: await listAgentWorkflows(agentName, dir) })
+    }
+    if (id && !action && req.method === 'DELETE') {
+      const { cancelled } = await forgetWorkflow(agentName, dir, id)
+      return json(200, { cancelledSchedules: cancelled, workflows: await listAgentWorkflows(agentName, dir) })
     }
     return json(404, { error: 'not found' })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    return json(err instanceof WorkflowError ? 400 : 500, { error: message })
+    return json(err instanceof WorkflowError || err instanceof WorkflowParamsError ? 400 : 500, { error: message })
   }
 }
 
@@ -1743,32 +1851,69 @@ function handleEnvGet(res: ServerResponse, agentName: string): void {
 // durable approval, and with no notifier at all it's denied rather than
 // left waiting on nobody — a scheduled run has no one live in it. ----
 
-const NO_HUMAN_ANSWER = 'No human is available to answer — this is an unattended scheduled run. Use your own best judgement and proceed without waiting for a response.'
+const NO_HUMAN_ANSWER = 'No human is available to answer — this is an unattended run. Use your own best judgement and proceed without waiting for a response.'
 
-async function fireScheduledTask(task: ScheduledTask, rawSessionId: string): Promise<{ kind: 'done'; text: string } | { kind: 'pending'; pendingIds: string[] }> {
-  const entry = getEntry(task.agent)
-  if (!entry) throw new Error(`no agent named "${task.agent}" in this project`)
+// One unattended agent turn: a scheduled task firing, or a workflow run
+// started by hand or by an app (core/workflow-runs.ts).
+async function executeUnattendedRun(agent: string, message: string, rawSessionId: string): Promise<{ kind: 'done'; text: string } | { kind: 'pending'; pendingIds: string[] }> {
+  const entry = getEntry(agent)
+  if (!entry) throw new Error(`no agent named "${agent}" in this project`)
   const tenant = 'default'
   const environment = process.env.LOOPENGINE_ENV ?? 'production'
-  const outcome = await sessions.withSession(`${tenant}:${environment}:${task.agent}:${rawSessionId}`, async (history) => {
-    const result = await runAgent(entry.config, entry.createModelCall(), task.message, history, {
+  const outcome = await sessions.withSession(`${tenant}:${environment}:${agent}:${rawSessionId}`, async (history) => {
+    const result = await runAgent(entry.config, entry.createModelCall(), message, history, {
       tenant,
       sessionId: rawSessionId,
       channel: 'http',
       approver: defaultHttpWebhookNotifier ?? { requestApproval: async () => false },
       questionHandler: defaultHttpWebhookNotifier ?? { requestQuestion: async () => NO_HUMAN_ANSWER },
     })
-    if (result.pending) await createCheckpointFromPending(task.agent, tenant, rawSessionId, result.pending)
+    if (result.pending) await createCheckpointFromPending(agent, tenant, rawSessionId, result.pending)
     return { newMessages: result.newMessages, result: { text: result.text, stopReason: result.stopReason, pendingIds: result.pending?.outstanding.map((o) => o.pendingId) } }
   })
   if (outcome.pendingIds?.length) return { kind: 'pending', pendingIds: outcome.pendingIds }
-  // run-agent's "you denied" wording is for someone live in a chat; in a
-  // scheduled run nobody denied anything, so say what actually happened.
+  // run-agent's "you denied" wording is for someone live in a chat; in an
+  // unattended run nobody denied anything, so say what actually happened.
   if (outcome.stopReason === 'denied') {
     const tools = /denied: (.+?)\. Send/.exec(outcome.text)?.[1] ?? 'a tool call'
-    throw new Error(`Not allowed: ${tools}. A call that needs approval is denied in a scheduled run unless the Permissions tab sends approval requests somewhere (or a rule denies it outright).`)
+    throw new Error(`Not allowed: ${tools}. A call that needs approval is denied in an unattended run unless the Permissions tab sends approval requests somewhere (or a rule denies it outright).`)
   }
   return { kind: 'done', text: outcome.text }
+}
+
+// A run started over the API with "notify" or "callback_url" reports
+// when it ends (and, to its callback, when it stops for a decision): its
+// result through the agent's notifier, and its record to the URL.
+async function reportWorkflowRun(run: WorkflowRun): Promise<void> {
+  const event: RunCallbackEvent | undefined = run.status === 'done' ? 'run.done' : run.status === 'error' ? 'run.failed' : run.status === 'awaiting_approval' ? 'run.awaiting_approval' : undefined
+  if (!event) return
+  const entry = getEntry(run.agent)
+  if (run.notify && entry && event !== 'run.awaiting_approval') {
+    const text = run.status === 'done' ? `Workflow ${run.workflow_id} for ${run.agent} ran:\n${run.result ?? ''}` : `Workflow ${run.workflow_id} for ${run.agent} failed: ${run.error ?? 'unknown error'}`
+    announceToNotifier(entry.config, text, { runId: run.run_id, workflowId: run.workflow_id, status: run.status, result: run.result ?? null, error: run.error ?? null }, defaultWebhook)
+  }
+  if (run.callback_url) {
+    const delivery = await deliverCallback(run.callback_url, event, runCallbackPayload(event, run))
+    await getRunStore().update(run.run_id, (r) => r && { ...r, callbacks: [...(r.callbacks ?? []), delivery].slice(-10) })
+  }
+}
+
+// Workflow runs, whatever starts them, each recorded apart from schedules.
+const workflowRunner = new WorkflowRunner({ execute: executeUnattendedRun, onChange: reportWorkflowRun })
+
+// A task that runs a workflow is also recorded as a run of that workflow,
+// so the workflow's Recent runs shows its scheduled runs too.
+function fireScheduledTask(task: ScheduledTask, rawSessionId: string): ReturnType<typeof executeUnattendedRun> {
+  if (!task.workflow_id) return executeUnattendedRun(task.agent, task.message, rawSessionId)
+  return workflowRunner.runForSchedule({
+    agent: task.agent,
+    workflow_id: task.workflow_id,
+    params: task.params,
+    task_id: task.task_id,
+    task_name: task.task_name,
+    message: task.message,
+    session_id: rawSessionId,
+  })
 }
 
 // A task with `notify` on reports each run through its agent's notifier.
@@ -1781,24 +1926,71 @@ function announceScheduledRun(task: ScheduledTask, run: ScheduledTaskRun): void 
   announceToNotifier(entry.config, text, { scheduledTaskId: task.task_id, taskName: task.task_name ?? null, status: run.status, result: run.result ?? null, error: run.error ?? null }, defaultWebhook)
 }
 
-const scheduler = new Scheduler({ fire: fireScheduledTask, onSettled: announceScheduledRun })
+// A workflow task's message is worked out at run time from the workflow
+// as it is then: its start message and steps, with the task's params
+// (which must still fit its parameters) filled in.
+const scheduler = new Scheduler({
+  fire: fireScheduledTask,
+  resolveWorkflowMessage: (agent, workflowId, params) => {
+    const workflow = getEntry(agent) ? readWorkflow(agentDir(agent), workflowId) : undefined
+    return workflow && workflowRunMessage(workflow, validateParams(workflow, params))
+  },
+  onSettled: announceScheduledRun,
+})
 
 function scheduleJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
 }
 
+// A workflow's start message with a task's params in its $name
+// placeholders (a declared one not given becomes empty), for the
+// Schedules tab; runs themselves use workflowRunMessage.
+function fillStartMessage(text: string, params: Record<string, string>, declared: string[]): string {
+  return text.replace(/\$([a-z_][a-z0-9_]*)/g, (match, name: string) =>
+    Object.prototype.hasOwnProperty.call(params, name) ? params[name]! : declared.includes(name) ? '' : match)
+}
+
+// The agent's tasks, a workflow task with its workflow's name and current
+// start message (or `workflow_missing` once the workflow is gone), and
+// the agent's workflows, for the New schedule form's choice.
 async function handleSchedulesGet(res: ServerResponse, agentName: string): Promise<void> {
   if (!getEntry(agentName)) return scheduleJson(res, 404, { error: `unknown agent '${agentName}'` })
-  scheduleJson(res, 200, { tasks: await listScheduledTasks({ agent: agentName }), time_zone: workspaceTimeZone() })
+  await migrateAgentWorkflows(agentName, agentDir(agentName))
+  const workflows = readWorkflows(agentDir(agentName))
+  const tasks = (await listScheduledTasks({ agent: agentName })).map((t) => {
+    if (!t.workflow_id) return t
+    const workflow = workflows.find((w) => w.id === t.workflow_id)
+    // Its start message as this task's runs see it, parameters filled in.
+    const startMessage = workflow && fillStartMessage(workflow.startMessage, t.params ?? {}, Object.keys(workflow.parameters))
+    return workflow ? { ...t, workflow: { id: workflow.id, title: workflow.title, start_message: startMessage } } : { ...t, workflow_missing: true }
+  })
+  scheduleJson(res, 200, {
+    tasks,
+    workflows: workflows.map((w) => ({ id: w.id, title: w.title, description: w.description, start_message: w.startMessage, parameters: w.parameters })),
+    time_zone: workspaceTimeZone(),
+  })
 }
 
 async function handleSchedulesPost(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
   if (!getEntry(agentName)) return scheduleJson(res, 404, { error: `unknown agent '${agentName}'` })
   const body = await readJsonBody(req)
+  const workflowId = typeof body.workflow_id === 'string' && body.workflow_id ? body.workflow_id : undefined
+  let params: Record<string, string> | undefined
+  if (workflowId) {
+    const workflow = readWorkflow(agentDir(agentName), workflowId)
+    if (!workflow) return scheduleJson(res, 400, { error: `${agentName} has no workflow "${workflowId}"` })
+    try {
+      params = validateParams(workflow, body.params)
+    } catch (err) {
+      return scheduleJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+    }
+  }
   try {
     const task = await createScheduledTask({
       agent: agentName,
-      message: String(body.message ?? ''),
+      message: typeof body.message === 'string' ? body.message : undefined,
+      workflow_id: workflowId,
+      ...(params && Object.keys(params).length ? { params } : {}),
       schedule: (body.schedule ?? {}) as { run_at?: unknown; every?: unknown; start_at?: unknown; at?: unknown; weekday?: unknown },
       task_name: typeof body.task_name === 'string' ? body.task_name : undefined,
       notify: body.notify === true,
@@ -3211,10 +3403,11 @@ async function respondAfterResolutionNow(res: ServerResponse, finalCheckpoint: T
     return { newMessages: result.newMessages, result: { text: result.text, stopReason: result.stopReason, pending: pendingSummary(result.pending) } }
   })
 
-  // A scheduled task's paused run (core/scheduler.ts) settles here.
-  void scheduler
-    .settleFromResume(finalCheckpoint.sessionId, { text: responseBody.text, pendingIds: responseBody.pending?.map((p) => p.pendingId) })
-    .catch((err) => console.error('[loopengine] could not settle scheduled run:', err))
+  // A scheduled task's paused run (core/scheduler.ts), or a workflow run's
+  // (core/workflow-runs.ts), settles here.
+  const resumed = { text: responseBody.text, pendingIds: responseBody.pending?.map((p) => p.pendingId) }
+  void scheduler.settleFromResume(finalCheckpoint.sessionId, resumed).catch((err) => console.error('[loopengine] could not settle scheduled run:', err))
+  void workflowRunner.settleFromResume(finalCheckpoint.sessionId, resumed).catch((err) => console.error('[loopengine] could not settle workflow run:', err))
   res.writeHead(200, { 'content-type': 'application/json' }).end(
     JSON.stringify({ text: responseBody.text, sessionId: finalCheckpoint.sessionId, ...(responseBody.stopReason ? { stopReason: responseBody.stopReason } : {}), ...(responseBody.pending ? { pending: responseBody.pending } : {}) }),
   )
@@ -3407,7 +3600,7 @@ async function tracked<T>(fn: () => Promise<T>): Promise<T> {
 async function handleActivityGet(res: ServerResponse): Promise<void> {
   res.writeHead(200, { 'content-type': 'application/json' }).end(
     JSON.stringify({
-      inFlightTurns: sessionTurns.size + scheduler.running + backgroundWork,
+      inFlightTurns: sessionTurns.size + scheduler.running + workflowRunner.running + backgroundWork,
       scheduledRuns: scheduler.running,
       // When the next scheduled task is due — wake this server by then
       // (POST /internal/scheduler/tick) if it's been stopped while idle.
@@ -3641,6 +3834,100 @@ async function decideFromMessaging(pendingId: string, decision: MessagingDecisio
   return { text: typeof body.text === 'string' ? body.text : undefined }
 }
 
+// ---- Webhook triggers (core/workflow-triggers.ts): an outside service
+// posts its own events to a workflow's secret URL. Answered 202 as soon as
+// the run starts (senders retry a slow or failed answer); a retry of a
+// delivery already handled, or an event the filter skips, is answered 202
+// too, so it isn't sent again. ----
+
+const WEBHOOK_MAX_BYTES = 1024 * 1024
+
+async function handleWorkflowHook(req: IncomingMessage, res: ServerResponse, token: string): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+  }
+  const raw = await readLimitedRawBuffer(req, WEBHOOK_MAX_BYTES)
+  if (!raw) return json(413, { error: 'The payload is larger than 1 MB.' })
+  // Unknown and turned-off triggers read the same, so a URL can't be probed.
+  const trigger = await findTriggerByToken(token)
+  if (!trigger || !trigger.enabled) return json(404, { error: 'not found' })
+  const at = new Date().toISOString()
+  const record = (outcome: Parameters<typeof recordDelivery>[1]['outcome'], extra: { delivery_id?: string; run_id?: string; detail?: string } = {}, seen?: string) =>
+    recordDelivery(trigger.trigger_id, { at, outcome, ...extra }, seen)
+
+  if (trigger.verify && !verifySenderSignature(trigger.verify, req.headers, raw)) {
+    await record('rejected', { detail: `The ${trigger.verify.sender} signature didn't match.` })
+    return json(401, { error: 'signature check failed' })
+  }
+  const payload = parsePayload(raw, req.headers['content-type'])
+  const id = deliveryId(req.headers, payload)
+  if (id && trigger.seen_ids.includes(id)) {
+    await record('duplicate', { delivery_id: id })
+    return json(202, { ignored: 'duplicate' })
+  }
+  if (!passesFilter(trigger.filter, payload)) {
+    await record('filtered', { ...(id ? { delivery_id: id } : {}) }, id)
+    return json(202, { ignored: 'filtered' })
+  }
+  if (!getEntry(trigger.agent)) {
+    await record('error', { detail: `The agent ${trigger.agent} is gone.` })
+    return json(404, { error: 'not found' })
+  }
+  try {
+    const prepared = await prepareWorkflowRun(trigger.agent, agentDir(trigger.agent), trigger.workflow_id, paramsFromPayload(trigger, payload))
+    const run = await workflowRunner.start({
+      agent: trigger.agent, workflow_id: trigger.workflow_id, params: prepared.params, source: 'webhook', trigger_id: trigger.trigger_id, message: prepared.message,
+      ...(trigger.notify ? { notify: true } : {}), ...(trigger.callback_url ? { callback_url: trigger.callback_url } : {}),
+    })
+    await record('started', { run_id: run.run_id, ...(id ? { delivery_id: id } : {}) }, id)
+    return json(202, { runId: run.run_id })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (err instanceof WorkflowError && /already running/.test(message)) {
+      await record('busy', { detail: message, ...(id ? { delivery_id: id } : {}) }, id)
+      return json(202, { ignored: 'already running' })
+    }
+    await record(err instanceof WorkflowError ? 'invalid' : 'error', { detail: message, ...(id ? { delivery_id: id } : {}) })
+    return json(err instanceof WorkflowError ? 422 : 500, { error: message })
+  }
+}
+
+// A workflow's webhook triggers, for the console: list, make (its URL is
+// shown once), change, rotate (a new URL), delete.
+async function handleWorkflowTriggers(req: IncomingMessage, res: ServerResponse, agentName: string, workflowId: string, triggerId: string | undefined, action: string | undefined): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+  }
+  if (!getEntry(agentName)) return json(404, { error: `unknown agent '${agentName}'` })
+  const workflow = readWorkflow(agentDir(agentName), workflowId)
+  if (!workflow) return json(404, { error: `no workflow ${workflowId} in ${agentName}` })
+  const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]
+  const base = `${forwardedProto || ((req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http')}://${String(req.headers['x-forwarded-host'] ?? req.headers.host ?? 'localhost')}`
+  const urlFor = (token: string) => `${base}/hooks/workflows/${token}`
+  try {
+    if (!triggerId && req.method === 'GET') return json(200, { triggers: (await listTriggers(agentName, workflowId)).map(publicTrigger) })
+    if (!triggerId && req.method === 'POST') {
+      const { trigger, token } = await createTrigger(agentName, workflow, await readJsonBody(req))
+      return json(201, { trigger: publicTrigger(trigger), url: urlFor(token) })
+    }
+    const existing = triggerId ? await getTriggerStore().get(triggerId) : undefined
+    if (!existing || existing.agent !== agentName || existing.workflow_id !== workflowId) return json(404, { error: 'no such trigger' })
+    if (action === 'rotate' && req.method === 'POST') {
+      const { trigger, token } = await rotateTrigger(existing.trigger_id)
+      return json(200, { trigger: publicTrigger(trigger), url: urlFor(token) })
+    }
+    if (!action && req.method === 'PUT') return json(200, { trigger: publicTrigger(await updateTrigger(existing.trigger_id, workflow, await readJsonBody(req))) })
+    if (!action && req.method === 'DELETE') {
+      await getTriggerStore().remove(existing.trigger_id)
+      return json(200, { removed: true })
+    }
+    return json(404, { error: 'not found' })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return json(err instanceof TriggerError || err instanceof CallbackUrlError ? 400 : 500, { error: message })
+  }
+}
+
 // Set once shutdown() starts, so /healthz turns 503 while the server
 // drains and a router or load balancer stops sending it new requests.
 let shuttingDown = false
@@ -3675,6 +3962,19 @@ const server = createServer(async (req, res) => {
     } catch (err) {
       console.error('[loopengine] Slack interaction failed:', err)
       if (!res.headersSent) res.writeHead(500).end()
+    }
+    return
+  }
+
+  // A workflow's webhook trigger: its token is the credential (no login).
+  const workflowHookMatch = req.method === 'POST' && (req.url ?? '/').split('?')[0].match(/^\/hooks\/workflows\/([A-Za-z0-9_-]+)$/)
+  if (workflowHookMatch) {
+    try {
+      lastRequestAt = Date.now()
+      await tracked(() => handleWorkflowHook(req, res, workflowHookMatch[1]))
+    } catch (err) {
+      console.error('[loopengine] workflow webhook failed:', err)
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Something went wrong.' }))
     }
     return
   }
@@ -3949,7 +4249,26 @@ const server = createServer(async (req, res) => {
       await handleAgentApp(req, res, decodeURIComponent(agentAppMatch[1]), decodeURIComponent(agentAppMatch[2]))
       return
     }
-    const agentWorkflowsMatch = pathname.match(/^\/agents\/([^/]+)\/workflows(?:\/([a-z0-9-]+))?(?:\/(run))?$/)
+    // The secret run callbacks are signed with, for whoever checks them.
+    if (req.method === 'GET' && pathname === '/runs/callback-secret') {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ secret: callbackSecret() }))
+      return
+    }
+    // One workflow run, by the runId its POST .../run returned.
+    const agentRunMatch = req.method === 'GET' && pathname.match(/^\/agents\/([^/]+)\/runs\/([A-Za-z0-9_-]+)$/)
+    if (agentRunMatch) {
+      const agentName = decodeURIComponent(agentRunMatch[1])
+      const run = getEntry(agentName) ? await getRun(agentName, agentRunMatch[2]) : undefined
+      res.writeHead(run ? 200 : 404, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+        .end(JSON.stringify(run ?? { error: `no run ${agentRunMatch[2]} for ${agentName}` }))
+      return
+    }
+    const triggersMatch = pathname.match(/^\/agents\/([^/]+)\/workflows\/([a-z0-9-]+)\/triggers(?:\/([A-Za-z0-9_-]+))?(?:\/(rotate))?$/)
+    if (triggersMatch) {
+      await handleWorkflowTriggers(req, res, decodeURIComponent(triggersMatch[1]), triggersMatch[2], triggersMatch[3], triggersMatch[4])
+      return
+    }
+    const agentWorkflowsMatch = pathname.match(/^\/agents\/([^/]+)\/workflows(?:\/([a-z0-9-]+))?(?:\/(run|runs))?$/)
     if (agentWorkflowsMatch) {
       await handleAgentWorkflows(req, res, decodeURIComponent(agentWorkflowsMatch[1]), agentWorkflowsMatch[2], agentWorkflowsMatch[3])
       return
@@ -4020,7 +4339,7 @@ const server = createServer(async (req, res) => {
         return
       }
       try {
-        const outcome = await runUpgrade({ busy: () => sessionTurns.size + scheduler.running > 0 })
+        const outcome = await runUpgrade({ busy: () => sessionTurns.size + scheduler.running + workflowRunner.running > 0 })
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, outcome, restarting: exitOnCodeChange }))
       } catch (err) {
         const status = err instanceof UpgradeError ? 409 : 500
@@ -4262,6 +4581,19 @@ const server = createServer(async (req, res) => {
     }
     if (schedulesMatch && req.method === 'POST') {
       await handleSchedulesPost(req, res, decodeURIComponent(schedulesMatch[1]))
+      return
+    }
+    // POST /schedules/:id/notify { "notify": true|false }: whether each
+    // run's result goes through the agent's notifier.
+    const scheduleNotifyMatch = req.method === 'POST' && pathname.match(/^\/schedules\/([A-Za-z0-9_-]+)\/notify$/)
+    if (scheduleNotifyMatch) {
+      const body = await readJsonBody(req)
+      if (typeof body.notify !== 'boolean') return scheduleJson(res, 400, { error: 'notify must be true or false' })
+      try {
+        scheduleJson(res, 200, await setScheduledTaskNotify(scheduleNotifyMatch[1], body.notify))
+      } catch (err) {
+        scheduleJson(res, err instanceof ScheduleError ? 404 : 500, { error: err instanceof Error ? err.message : String(err) })
+      }
       return
     }
     const scheduleActionMatch = req.method === 'POST' && pathname.match(/^\/schedules\/([A-Za-z0-9_-]+)\/(run|pause|resume|cancel)$/)
@@ -4540,7 +4872,16 @@ server.listen(port, () => {
   console.log(`agent API listening on :${port}`)
   void warmAgentTools()
   // LOOPENGINE_SCHEDULER=off leaves scheduling to another process.
-  if (process.env.LOOPENGINE_SCHEDULER !== 'off') void scheduler.start().catch((err) => console.error('[loopengine] scheduler failed to start:', err))
+  // Workflows from before they were skills move into their skills first,
+  // so their schedules run them.
+  const startScheduling = async () => {
+    for (const name of listAgents()) await migrateAgentWorkflows(name, agentDir(name)).catch((err) => console.error(`[loopengine] moving ${name}'s workflows.yml failed:`, err))
+    if (process.env.LOOPENGINE_SCHEDULER !== 'off') {
+      await workflowRunner.recover()
+      await scheduler.start()
+    }
+  }
+  void startScheduling().catch((err) => console.error('[loopengine] scheduler failed to start:', err))
 })
 
 // An agent that leaves `tools` unset gets its tools/ folder imported
