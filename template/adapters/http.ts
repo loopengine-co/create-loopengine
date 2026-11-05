@@ -67,6 +67,7 @@ import {
   type AgentConfig,
   type AgentModelConfig,
   type ToolDefinition,
+  type Message,
   type ModelContentBlock,
   type RunAgentResult,
   playgroundHtml,
@@ -120,6 +121,8 @@ import {
   agentDirFor,
   verifyProxyIdentity,
   TRUSTED_PROXY_IDENTITY_HEADER,
+  reportRun,
+  usedTool,
   NotifierFileError,
   verifyDecisionToken,
   decidePath,
@@ -1925,6 +1928,8 @@ async function executeUnattendedRun(agent: string, message: string, rawSessionId
 async function reportWorkflowRun(run: WorkflowRun): Promise<void> {
   const event: RunCallbackEvent | undefined = run.status === 'done' ? 'run.done' : run.status === 'error' ? 'run.failed' : run.status === 'awaiting_approval' ? 'run.awaiting_approval' : undefined
   if (!event) return
+  // For a host's run observer (core/run-events.ts); a failed run isn't reported.
+  if (run.status !== 'error') reportRun({ agent: run.agent, source: 'workflow', id: run.run_id, via: run.source, usedTool: true })
   const entry = getEntry(run.agent)
   if (run.notify && entry && event !== 'run.awaiting_approval') {
     const text = run.status === 'done' ? `Workflow ${run.workflow_id} for ${run.agent} ran:\n${run.result ?? ''}` : `Workflow ${run.workflow_id} for ${run.agent} failed: ${run.error ?? 'unknown error'}`
@@ -1942,7 +1947,12 @@ const workflowRunner = new WorkflowRunner({ execute: executeUnattendedRun, onCha
 // A task that runs a workflow is also recorded as a run of that workflow,
 // so the workflow's Recent runs shows its scheduled runs too.
 function fireScheduledTask(task: ScheduledTask, rawSessionId: string): ReturnType<typeof executeUnattendedRun> {
-  if (!task.workflow_id) return executeUnattendedRun(task.agent, task.message, rawSessionId)
+  if (!task.workflow_id) {
+    return executeUnattendedRun(task.agent, task.message, rawSessionId).then((outcome) => {
+      reportRun({ agent: task.agent, source: 'schedule', id: randomUUID(), usedTool: true })
+      return outcome
+    })
+  }
   return workflowRunner.runForSchedule({
     agent: task.agent,
     workflow_id: task.workflow_id,
@@ -2917,6 +2927,19 @@ async function raceAndRespond(res: ServerResponse, agentName: string, rawSession
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(responseBody))
 }
 
+// Who sent a message, as a trusted proxy says in its signed identity:
+// an API key (role "api") or a signed-in person. Without a proxy, unknown.
+function messageCaller(req: IncomingMessage): 'api' | 'console' | 'unknown' {
+  const identity = trustedProxySecret ? verifyProxyIdentity(req.headers[TRUSTED_PROXY_IDENTITY_HEADER], trustedProxySecret) : undefined
+  if (!identity) return 'unknown'
+  return identity.role === 'api' ? 'api' : 'console'
+}
+
+// For a host's run observer (core/run-events.ts).
+function reportMessageRun(req: IncomingMessage, agent: string, newMessages: Message[]): void {
+  reportRun({ agent, source: 'message', id: randomUUID(), caller: messageCaller(req), usedTool: usedTool(newMessages) })
+}
+
 async function handleMessages(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
   const parsed = await parseRequest(req, agentName)
   if (!parsed.ok) {
@@ -2982,6 +3005,7 @@ async function handleMessages(req: IncomingMessage, res: ServerResponse, agentNa
         pushSignal(state, { type: 'question', entry: question })
       },
     })
+    reportMessageRun(req, agentName, result.newMessages)
     if (result.pending) {
       await createCheckpointFromPending(agentName, tenant, rawSessionId, result.pending)
     }
@@ -3092,6 +3116,7 @@ async function handleMessagesStream(req: IncomingMessage, res: ServerResponse, a
         pushSignal(state, { type: 'question', entry: question })
       },
     })
+    reportMessageRun(req, agentName, result.newMessages)
     if (result.pending) {
       await createCheckpointFromPending(agentName, tenant, rawSessionId, result.pending)
     }
@@ -3963,7 +3988,7 @@ function jobDeps(agentName: string, entry: RegistryEntry, connector: MessagingCo
     connector,
     plan: process.env.LOOPENGINE_PLAN,
     allowed: (message) => jobAllowed(entry.config, app, message),
-    runTurn: (sessionId, text) => runJobTurn(agentName, sessionId, text),
+    runTurn: (sessionId, text) => runJobTurn(agentName, sessionId, text, connector.app === 'telegram' ? 'telegram' : 'slack'),
     decideLink: (pendingId, kind) => {
       const base = publicBaseUrl(connectionPublicUrl(entry.config, app))
       return base ? `${base}${decidePath(pendingId, kind)}` : undefined
@@ -3998,7 +4023,7 @@ function jobTurnOf(text: string, pending: PendingSummary[] | undefined): JobTurn
 }
 
 // One turn of a job thread: the same session for the whole thread.
-async function runJobTurn(agent: string, rawSessionId: string, message: string): Promise<JobTurn> {
+async function runJobTurn(agent: string, rawSessionId: string, message: string, source: 'slack' | 'telegram'): Promise<JobTurn> {
   const entry = getEntry(agent)
   if (!entry) throw new Error(`no agent named "${agent}" in this project`)
   const tenant = 'default'
@@ -4011,6 +4036,8 @@ async function runJobTurn(agent: string, rawSessionId: string, message: string):
       approver: threadApprover,
       questionHandler: threadQuestions,
     })
+    // For a host's run observer (core/run-events.ts).
+    reportRun({ agent, source, id: randomUUID(), usedTool: usedTool(result.newMessages) })
     if (result.pending) await createCheckpointFromPending(agent, tenant, rawSessionId, result.pending)
     return { newMessages: result.newMessages, result: { text: result.text, pending: pendingSummary(result.pending) } }
   })
