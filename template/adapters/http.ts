@@ -649,7 +649,11 @@ async function describeAgent(entry: RegistryEntry): Promise<Record<string, unkno
     // tab badge; the Apps tab's own GET .../abilities has the detail
     // (and its slower npm version lookups).
     abilityCount: listInstalledAbilities(config.name).length,
-    skills: skillIndex.map((s) => ({ name: s.name, description: s.description })),
+    // A skill that's a workflow is edited as one, on the Workflows tab.
+    skills: (() => {
+      const workflowIds = new Set(readWorkflows(agentDirFor(config)).map((w) => w.id))
+      return skillIndex.map((s) => ({ name: s.name, description: s.description, ...(workflowIds.has(s.name) ? { workflow: true } : {}) }))
+    })(),
     systemSkills: systemSkillIndex.map((s) => ({ name: s.name, description: s.description })),
     tools: tools.map(describeTool),
     // createAskUserTool() with no onPending, purely to describe its
@@ -2009,12 +2013,14 @@ async function handleSchedulesGet(res: ServerResponse, agentName: string): Promi
     if (!t.workflow_id) return t
     const workflow = workflows.find((w) => w.id === t.workflow_id)
     // Its start message as this task's runs see it, parameters filled in.
-    const startMessage = workflow && fillStartMessage(workflow.startMessage, t.params ?? {}, Object.keys(workflow.parameters))
-    return workflow ? { ...t, workflow: { id: workflow.id, title: workflow.title, start_message: startMessage } } : { ...t, workflow_missing: true }
+    // An older workflow's start message, else its instructions' first line.
+    const lead = workflow && (workflow.startMessage || workflow.instructions.split('\n').find((line) => line.trim()) || '')
+    const startMessage = workflow && fillStartMessage(lead!, t.params ?? {}, Object.keys(workflow.parameters))
+    return workflow ? { ...t, workflow: { id: workflow.id, title: workflow.title, description: workflow.description, start_message: startMessage } } : { ...t, workflow_missing: true }
   })
   scheduleJson(res, 200, {
     tasks,
-    workflows: workflows.map((w) => ({ id: w.id, title: w.title, description: w.description, start_message: w.startMessage, parameters: w.parameters })),
+    workflows: workflows.map((w) => ({ id: w.id, title: w.title, description: w.description, start_message: w.startMessage || w.instructions.split('\n').find((line) => line.trim()) || '', parameters: w.parameters })),
     time_zone: workspaceTimeZone(),
   })
 }
