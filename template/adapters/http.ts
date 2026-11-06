@@ -89,6 +89,7 @@ import {
   setInterviewProject,
   type InterviewAgentSource,
   WORKFLOW_EXAMPLES,
+  WORKFLOW_EXAMPLE_MESSAGES,
   globalConfigPageHtml,
   addGatewayTool,
   agentDir,
@@ -1456,7 +1457,7 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
     } catch {
       picked = undefined
     }
-    if (!action && req.method === 'GET') return json(200, { ready: Boolean(picked), canInstallAbilities: secretsProtected, agents: listAgents(), examples: WORKFLOW_EXAMPLES })
+    if (!action && req.method === 'GET') return json(200, { ready: Boolean(picked), canInstallAbilities: secretsProtected, agents: listAgents(), examples: WORKFLOW_EXAMPLES, messages: WORKFLOW_EXAMPLE_MESSAGES })
     // A planning job's progress (the page checks every few seconds).
     if (action === 'plan' && jobId && req.method === 'GET') {
       const job = getPlanJob(jobId)
