@@ -40,16 +40,6 @@ import {
   loadAgentModule,
   synthesizeCreateModelCall,
   editAgentFile,
-  createHttpTool,
-  updateHttpTool,
-  readHttpToolSpec,
-  listEditableHttpToolNames,
-  HttpToolNameError,
-  HttpToolExistsError,
-  HttpToolIndexShapeError,
-  HttpToolNotFoundError,
-  HttpToolNotEditableError,
-  type HttpToolSpec,
   AgentEditNotSupportedError,
   AgentFileNotFoundError,
   type AgentEditResult,
@@ -70,6 +60,7 @@ import {
   type Message,
   type ModelContentBlock,
   type RunAgentResult,
+  SkillGarden,
   playgroundHtml,
   agentsConfigPageHtml,
   agentsListPageHtml,
@@ -82,14 +73,12 @@ import {
   getInterview,
   interviewTools,
   listInterviews,
-  pickInterviewModel,
   pickAgentModel,
+  pickInterviewModel,
   previewCandidate,
   startInterview,
   setInterviewProject,
   type InterviewAgentSource,
-  WORKFLOW_EXAMPLES,
-  WORKFLOW_EXAMPLE_MESSAGES,
   globalConfigPageHtml,
   addGatewayTool,
   agentDir,
@@ -114,20 +103,77 @@ import {
   unsetEnvVar,
   setAgentEnvVar,
   unsetAgentEnvVar,
-  createAgentEnv,
+  EnvVarNameError,
   agentDirFor,
-  verifyProxyIdentity,
+  createAgentEnv,
+  WorkflowParamsError,
+  readWorkflow,
+  readWorkflows,
+  validateParams,
+  workflowRunMessage,
+  substituteParameters,
+  WorkflowRunner,
+  getRun,
+  getRunStore,
+  listRuns,
+  type WorkflowRun,
+  CallbackUrlError,
+  callbackSecret,
+  checkCallbackUrl,
+  deliverCallback,
+  runCallbackPayload,
+  type RunCallbackEvent,
+  TriggerError,
+  createTrigger,
+  deliveryId,
+  findTriggerByToken,
+  getTriggerStore,
+  listTriggers,
+  paramsFromPayload,
+  parsePayload,
+  passesFilter,
+  publicTrigger,
+  recordTriggerDelivery as recordDelivery,
+  rotateTrigger,
+  updateTrigger,
+  verifySenderSignature,
   TRUSTED_PROXY_IDENTITY_HEADER,
+  verifyProxyIdentity,
   reportRun,
   usedTool,
+  loopengineVersion,
+  describeUpgrade,
+  runUpgrade,
+  UpgradeError,
   NotifierFileError,
-  verifyDecisionToken,
   decidePath,
-  renderDecidePage,
+  verifyDecisionToken,
   renderDecideGonePage,
   renderDecideInvalidPage,
-  describeAgentNotifier,
+  renderDecidePage,
+  agentApprovers,
+  agentTelegramWebhookInfo,
   announceToNotifier,
+  clickAllowed,
+  connectionPublicUrl,
+  conversationsOn,
+  describeAgentNotifier,
+  jobAllowed,
+  jobsOn,
+  listAgentPending,
+  listAgentSlackChannels,
+  listAgentSlackMembers,
+  listAgentTelegramPeople,
+  removeAgentNotifier,
+  saveAgentNotifier,
+  setAgentApprovers,
+  setAgentPrimaryNotifier,
+  setupAgentTelegramWebhook,
+  slackClickAllowed,
+  slackCredentialsFor,
+  telegramCredentialsFor,
+  testAgentNotifier,
+  type TwoWayApp,
   Scheduler,
   ScheduleError,
   cancelScheduledTask,
@@ -143,41 +189,14 @@ import {
   setScheduledTaskNotify,
   type ScheduledTask,
   type ScheduledTaskRun,
-  listAgentPending,
-  listAgentSlackChannels,
-  slackCredentialsFor,
-  agentTelegramWebhookInfo,
-  clickAllowed,
-  connectionPublicUrl,
-  conversationsOn,
-  jobAllowed,
-  jobsOn,
-  listAgentTelegramPeople,
-  setupAgentTelegramWebhook,
-  telegramCredentialsFor,
-  type TwoWayApp,
-  slackClickAllowed,
-  agentApprovers,
-  setAgentApprovers,
-  setAgentPrimaryNotifier,
-  listAgentSlackMembers,
-  replyPrivatelyInSlack,
-  slackArgs,
-  type MessagingDecision,
-  type DecisionOutcome,
-  type MessagingDeps,
-  handleMessagingAction,
-  settleThreadChoice,
-  describeChange,
-  openSlackAnswerModal,
-  parseSlackInteraction,
-  replyInSlack,
-  slackOutcomeText,
-  verifySlackRequest,
   firstSighting,
   handleInboundMessage,
-  createSlackConnector,
+  handleMessagingAction,
   outcomeText,
+  settleThreadChoice,
+  type DecisionOutcome,
+  type MessagingDecision,
+  type MessagingDeps,
   handleJobMessage,
   isJobMessage,
   settleJobThread,
@@ -199,29 +218,16 @@ import {
   telegramRootOf,
   verifyTelegramRequest,
   type TelegramUpdate,
+  describeChange,
+  createSlackConnector,
+  openSlackAnswerModal,
   parseSlackEvent,
-  removeAgentNotifier,
-  saveAgentNotifier,
-  testAgentNotifier,
-  EnvVarNameError,
-  readActauthConfig,
-  addActauthRule,
-  updateActauthRule,
-  removeActauthRule,
-  setDefaultDecision,
-  ActauthRuleExistsError,
-  ActauthRuleNotFoundError,
-  installAbility,
-  upgradeAbility,
-  removeAbility,
-  listInstalledAbilities,
-  backfillDependencies,
-  configureAgentMcpTools,
-  AbilityAlreadyInstalledError,
-  AbilityCollisionError,
-  AbilityManifestError,
-  AbilityVersionError,
-  AbilityNotInstalledError,
+  parseSlackInteraction,
+  replyInSlack,
+  replyPrivatelyInSlack,
+  slackArgs,
+  slackOutcomeText,
+  verifySlackRequest,
   searchPublicAbilities,
   fetchLatestAbilityVersion,
   describeAbilitySources,
@@ -250,13 +256,15 @@ import {
   addWorkspaceAbility,
   listWorkspaceAbilities,
   removeWorkspaceAbility,
-  getMcpServer,
-  searchMcpServers,
-  savedMcpServers,
-  ownMcpServer,
-  saveMcpServer,
-  removeSavedMcpServer,
+  WORKFLOW_EXAMPLES,
+  WORKFLOW_EXAMPLE_MESSAGES,
   McpServerInputError,
+  getMcpServer,
+  ownMcpServer,
+  removeSavedMcpServer,
+  saveMcpServer,
+  savedMcpServers,
+  searchMcpServers,
   type McpDirectoryServer,
   isMcpAuthError,
   listMcpServerTools,
@@ -279,11 +287,36 @@ import {
   abilityOrigin,
   readAbilitySources,
   type AbilitySource,
+  installAbility,
+  upgradeAbility,
+  removeAbility,
+  listInstalledAbilities,
+  backfillDependencies,
+  configureAgentMcpTools,
+  AbilityAlreadyInstalledError,
+  AbilityCollisionError,
+  AbilityManifestError,
+  AbilityVersionError,
+  AbilityNotInstalledError,
+  createHttpTool,
+  updateHttpTool,
+  readHttpToolSpec,
+  listEditableHttpToolNames,
+  HttpToolNameError,
+  HttpToolExistsError,
+  HttpToolIndexShapeError,
+  HttpToolNotFoundError,
+  HttpToolNotEditableError,
+  type HttpToolSpec,
+  readActauthConfig,
+  addActauthRule,
+  updateActauthRule,
+  removeActauthRule,
+  setDefaultDecision,
+  ActauthRuleExistsError,
+  ActauthRuleNotFoundError,
   describeModelProviders,
-  loopengineVersion,
-  describeUpgrade,
-  runUpgrade,
-  UpgradeError,
+  describeGateways,
   setModelProviderKey,
   clearModelProviderKey,
   listProviderModels,
@@ -292,7 +325,6 @@ import {
   setWorkspaceTimeZone,
   TimeZoneError,
   workspaceTimeZone,
-  describeGateways,
   scaffoldAgent,
   AgentNameError,
   AgentExistsError,
@@ -303,11 +335,6 @@ import {
   decideApproval,
   findApproval,
   listQuestions,
-  // answerQuestion here is the server-side resolver (aliased from
-  // loopengine's own resolvePendingQuestion) — not the HTTP client-side
-  // helper of the same name loopengine also exports for a browser/Node
-  // caller talking *to* this file's own routes; this file is the server,
-  // so it needs the former.
   resolvePendingQuestion as answerQuestion,
   findQuestion,
   createAskUserTool,
@@ -315,43 +342,10 @@ import {
   type PendingQuestion,
   WebhookNotifier,
   publicBaseUrl,
-  // Workflows (skills with a start message), their runs, run callbacks
-  // and webhook triggers.
-  WorkflowParamsError,
-  readWorkflow,
-  readWorkflows,
-  validateParams,
-  workflowRunMessage,
-  WorkflowRunner,
-  getRun,
-  getRunStore,
-  listRuns,
-  type WorkflowRun,
-  CallbackUrlError,
-  callbackSecret,
-  checkCallbackUrl,
-  deliverCallback,
-  runCallbackPayload,
-  type RunCallbackEvent,
-  TriggerError,
-  createTrigger,
-  deliveryId,
-  findTriggerByToken,
-  getTriggerStore,
-  listTriggers,
-  paramsFromPayload,
-  parsePayload,
-  passesFilter,
-  publicTrigger,
-  recordTriggerDelivery as recordDelivery,
-  rotateTrigger,
-  updateTrigger,
-  verifySenderSignature,
+  type LoopEvent,
+  storageSigners,
 } from 'loopengine'
-import { SkillGarden } from 'loopengine'
 import type { Decision, PendingApproval } from 'actauth'
-import type { LoopEvent } from 'loopengine'
-import { storageSigners } from 'loopengine'
 
 const sessions = createSessionStore()
 const checkpoints = createCheckpointStore()
@@ -387,7 +381,6 @@ const defaultHttpWebhookNotifier =
 // section (web/notifier-admin.ts) to show and test.
 const defaultWebhook =
   defaultHttpWebhookUrl && defaultHttpWebhookSecret ? { webhookUrl: defaultHttpWebhookUrl, webhookSecret: defaultHttpWebhookSecret } : undefined
-
 
 // Used when an AgentConfig doesn't define its own sessionIdFor — a plain
 // client-supplied key, same shape adapters/cli.ts's --session flag
@@ -587,8 +580,8 @@ function describeTool(t: { name: string; description: string; safe?: boolean; in
 async function describeAgent(entry: RegistryEntry): Promise<Record<string, unknown>> {
   const { config } = entry
   // Which localTools the Tools tab's Edit button applies to — only the
-  // ones with a saved spec (loopengine's own sidecar spec file), i.e.
-  // only tools this same admin UI generated in the first place.
+  // ones with a saved spec (web/http-tool-admin.ts's own sidecar file),
+  // i.e. only tools this same admin UI generated in the first place.
   const editableHttpToolNames = new Set(listEditableHttpToolNames(config.name))
   // Kept separate (not just concatenated into one `tools` array — though
   // that's still returned too, below, for Overview's own at-a-glance
@@ -619,11 +612,11 @@ async function describeAgent(entry: RegistryEntry): Promise<Record<string, unkno
   // configured for *this* agent, so the config page's own Skills tab
   // deliberately doesn't mix it into skills/skillsDirs below.
   const skillsDirs = config.skillsDirs ?? [`agents/${config.name}/skills`]
-  // Same defaults, same reasoning, as loopengine's own run-agent.ts
-  // SkillGarden/BudgetTracker construction — kept in sync there and here
-  // since this is what a "Skills"/"Limits & budgets" tab shows an
-  // operator, and it has to describe what runAgent() would actually
-  // resolve, not a second guess (see this function's own header comment).
+  // Same defaults, same reasoning, as run-agent.ts's own SkillGarden/
+  // BudgetTracker construction — kept in sync there and here since this
+  // is what a "Skills"/"Limits & budgets" tab shows an operator, and it
+  // has to describe what runAgent() would actually resolve, not a second
+  // guess (see this function's own header comment).
   const skillGarden = new SkillGarden({ dirs: skillsDirs, indexBudgetTokens: config.skillIndexBudgetTokens ?? 2000 })
   const skillIndex = skillGarden.buildIndex().included
   const systemSkillGarden = new SkillGarden({ dirs: [systemSkillsDir], indexBudgetTokens: config.skillIndexBudgetTokens ?? 2000 })
@@ -631,13 +624,14 @@ async function describeAgent(entry: RegistryEntry): Promise<Record<string, unkno
 
   return {
     name: config.name,
+    ...(config.displayName ? { displayName: config.displayName } : {}),
     systemPrompt: config.systemPrompt,
     model: config.model
       ? {
           provider: config.model.provider,
           model: config.model.model,
           maxTokens: config.model.maxTokens,
-          // Only the 'openai' variant of AgentModelConfig carries this —
+          // Only the 'openai' and 'anthropic' variants of AgentModelConfig carry this —
           // an `in` check rather than a cast, so a provider that can
           // never have it just reports undefined instead of needing its
           // own narrowing branch here.
@@ -818,17 +812,17 @@ function parseHttpToolBody(body: Record<string, unknown>): { ok: true; value: Ht
 }
 
 // Backs the Tools tab's "Create an HTTP tool" form — generates a real
-// agents/:name/tools/<tool>.ts file (loopengine's own createHttpTool),
-// then splices the freshly-imported ToolDefinition straight into this
-// process's own live registry via updateAgent (../agent-registry.js) —
-// the same "no restart needed" mechanism a newly-created agent already
-// gets (see registerAgent's own doc comment), and deliberately not a
-// reliance on tsx watch picking up the new file: this way the tool is
-// callable immediately under `serve` (no watch) too, not just `dev`. An
-// optional `decision` seeds one actauth.yml rule via the already-existing
-// addActauthRule, mirroring gateway-tools.ts's own "a rule is opt-in,
-// omitting it falls through to default_decision" precedent — never a
-// hardcoded default here.
+// agents/:name/tools/<tool>.ts file (web/http-tool-admin.ts's
+// createHttpTool), then splices the freshly-imported ToolDefinition
+// straight into this process's own live registry via updateAgent
+// (core/agent-registry.ts) — the same "no restart needed" mechanism a
+// newly-created agent already gets (see registerAgent's own doc
+// comment), and deliberately not a reliance on tsx watch picking up the
+// new file: this way the tool is callable immediately under `serve`
+// (no watch) too, not just `dev`. An optional `decision` seeds one
+// actauth.yml rule via the already-existing addActauthRule, mirroring
+// gateway-tools.ts's own "a rule is opt-in, omitting it falls through
+// to default_decision" precedent — never a hardcoded default here.
 async function handleHttpToolPost(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
   const entry = getEntry(agentName)
   if (!entry) {
@@ -1030,6 +1024,13 @@ function parseAgentTemplateOptions(body: Record<string, unknown>): { ok: true; v
   if (typeof body.systemPrompt === 'string' && body.systemPrompt.trim()) {
     options.systemPrompt = body.systemPrompt
   }
+  // Kept even when empty: on an edit, that clears it.
+  if (body.displayName !== undefined && body.displayName !== null) {
+    if (typeof body.displayName !== 'string') return { ok: false, error: 'displayName must be a string' }
+    const displayName = body.displayName.trim().replace(/\s+/g, ' ')
+    if (displayName.length > 60) return { ok: false, error: 'displayName: 60 characters at most' }
+    options.displayName = displayName
+  }
   if (body.model !== undefined && body.model !== null) {
     if (typeof body.model !== 'object') {
       return { ok: false, error: 'model must be an object' }
@@ -1057,9 +1058,9 @@ function parseAgentTemplateOptions(body: Record<string, unknown>): { ok: true; v
 // parseAgentTemplateOptions since that one's shape (AgentTemplateOptions)
 // is shared with handleCreateAgent/scaffoldAgent, which has no notion of
 // these three at all (a freshly scaffolded agent always starts on
-// loopengine's own defaults — see AgentConfig's own doc comments). Each
-// of the three is optional and independent, same as systemPrompt/model
-// above.
+// run-agent.ts's own defaults — see AgentConfig's own doc comments).
+// Each of the three is optional and independent, same as systemPrompt/
+// model above.
 function parsePositiveInt(value: unknown, field: string): { ok: true; value: number | undefined } | { ok: false; error: string } {
   if (value === undefined || value === null) return { ok: true, value: undefined }
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
@@ -1145,7 +1146,7 @@ async function handleInterviews(req: IncomingMessage, res: ServerResponse, pathn
   }
 }
 
-// "Describe a workflow" (loopengine's web/workflow-admin.ts): what the planner and the
+// "Describe a workflow" (web/workflow-admin.ts): what the planner and the
 // checks know about each agent: its tools, abilities, rules and primary
 // messaging app.
 async function workflowAgentInfo(): Promise<WorkflowAgentInfo[]> {
@@ -1744,7 +1745,7 @@ async function handleEditAgent(req: IncomingMessage, res: ServerResponse, agentN
   if (Object.keys(editFields).length === 0) {
     res
       .writeHead(400, { 'content-type': 'application/json' })
-      .end(JSON.stringify({ error: 'systemPrompt, model, maxTurns, contextBudgetTokens, or skillIndexBudgetTokens is required' }))
+      .end(JSON.stringify({ error: 'displayName, systemPrompt, model, maxTurns, contextBudgetTokens, or skillIndexBudgetTokens is required' }))
     return
   }
 
@@ -1760,29 +1761,27 @@ async function handleEditAgent(req: IncomingMessage, res: ServerResponse, agentN
 
   const configPatch: Partial<AgentConfig> = {}
   if (result.systemPrompt !== undefined) configPatch.systemPrompt = result.systemPrompt
+  if (result.displayName !== undefined) configPatch.displayName = result.displayName || undefined
   if (result.maxTurns !== undefined) configPatch.maxTurns = result.maxTurns
   if (result.contextBudgetTokens !== undefined) configPatch.contextBudgetTokens = result.contextBudgetTokens
   if (result.skillIndexBudgetTokens !== undefined) configPatch.skillIndexBudgetTokens = result.skillIndexBudgetTokens
   let createModelCall: RegistryEntry['createModelCall'] | undefined
   if (result.model) {
     // editAgentFile's own AgentEditResult.model is one flat shape across
-    // every provider (see that file's own reasoningEffort-only-for-openai
-    // check) — AgentModelConfig is a discriminated union instead, so
-    // reasoningEffort only ever type-checks on the 'openai' branch.
+    // every provider (see that file's own REASONING_PROVIDERS check) —
+    // AgentModelConfig is a discriminated union instead, so
+    // reasoningEffort only type-checks on the 'openai' and 'anthropic'
+    // branches.
     // reasoningEffort itself is narrowed no further than `string` at this
     // boundary (same as `model` — an arbitrary provider-defined name, not
     // an enum this layer validates); an invalid value surfaces as a clear
     // rejection from the provider's own API, same as an invalid model name
     // already does.
     const m = result.model
+    const reasoningEffort = m.reasoningEffort as Extract<AgentModelConfig, { provider: 'openai' }>['reasoningEffort']
     const modelConfig: AgentModelConfig =
-      m.provider === 'openai'
-        ? {
-            provider: 'openai',
-            model: m.model,
-            maxTokens: m.maxTokens,
-            reasoningEffort: m.reasoningEffort as Extract<AgentModelConfig, { provider: 'openai' }>['reasoningEffort'],
-          }
+      m.provider === 'openai' || m.provider === 'anthropic'
+        ? { provider: m.provider, model: m.model, maxTokens: m.maxTokens, reasoningEffort }
         : { provider: m.provider, model: m.model, maxTokens: m.maxTokens }
     configPatch.model = modelConfig
     createModelCall = await synthesizeCreateModelCall(modelConfig)
@@ -1860,10 +1859,9 @@ function handleSkillDelete(res: ServerResponse, agentName: string, skillId: stri
 }
 
 // Backs the Admin UI's "Environment" section — every env var an ability
-// (see loopengine's own ABILITIES.md, bin/ability-manager.ts) declared it
-// needs for this agent, with set/not-set status only. Read-only, so no
-// extra auth gate beyond the normal Basic Auth middleware every admin
-// route already has.
+// (see ABILITIES.md, bin/ability-manager.ts) declared it needs for this
+// agent, with set/not-set status only. Read-only, so no extra auth gate
+// beyond the normal Basic Auth middleware every admin route already has.
 function handleEnvGet(res: ServerResponse, agentName: string): void {
   if (!getEntry(agentName)) {
     res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `unknown agent '${agentName}'` }))
@@ -1872,7 +1870,7 @@ function handleEnvGet(res: ServerResponse, agentName: string): void {
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(listDeclaredEnvVars(agentName)))
 }
 
-// ---- Scheduled tasks (loopengine's core/scheduler.ts). A task fires through the same
+// ---- Scheduled tasks (core/scheduler.ts). A task fires through the same
 // path as a plain POST /agents/:name/messages: the session is kept, an
 // "ask" goes to the agent's notifier (or the default webhook) as a
 // durable approval, and with no notifier at all it's denied rather than
@@ -1976,14 +1974,6 @@ function scheduleJson(res: ServerResponse, status: number, body: unknown): void 
   res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
 }
 
-// A workflow's start message with a task's params in its $name
-// placeholders (a declared one not given becomes empty), for the
-// Schedules tab; runs themselves use workflowRunMessage.
-function fillStartMessage(text: string, params: Record<string, string>, declared: string[]): string {
-  return text.replace(/\$([a-z_][a-z0-9_]*)/g, (match, name: string) =>
-    Object.prototype.hasOwnProperty.call(params, name) ? params[name]! : declared.includes(name) ? '' : match)
-}
-
 // The agent's tasks, a workflow task with its workflow's name and current
 // start message (or `workflow_missing` once the workflow is gone), and
 // the agent's workflows, for the New schedule form's choice.
@@ -1997,7 +1987,7 @@ async function handleSchedulesGet(res: ServerResponse, agentName: string): Promi
     // Its start message as this task's runs see it, parameters filled in.
     // An older workflow's start message, else its instructions' first line.
     const lead = workflow && (workflow.startMessage || workflow.instructions.split('\n').find((line) => line.trim()) || '')
-    const startMessage = workflow && fillStartMessage(lead!, t.params ?? {}, Object.keys(workflow.parameters))
+    const startMessage = workflow && substituteParameters(lead!, t.params ?? {}, { declared: Object.keys(workflow.parameters) })
     return workflow ? { ...t, workflow: { id: workflow.id, title: workflow.title, description: workflow.description, start_message: startMessage } } : { ...t, workflow_missing: true }
   })
   scheduleJson(res, 200, {
@@ -2224,7 +2214,7 @@ async function handlePendingGet(res: ServerResponse, agentName: string): Promise
 
 // `?slot=agent` targets this agent's own agents/<name>/.env (a per-agent
 // value, read by its tools through ToolContext.env) instead of the
-// project-wide .env — see loopengine's DeclaredEnvVar.slot.
+// project-wide .env — see web/env-admin.ts's DeclaredEnvVar.slot.
 function envSlotOf(req: IncomingMessage): 'shared' | 'agent' | undefined {
   const slot = new URL(req.url ?? '/', 'http://localhost').searchParams.get('slot') ?? 'shared'
   return slot === 'shared' || slot === 'agent' ? slot : undefined
@@ -2235,9 +2225,9 @@ function envSlotOf(req: IncomingMessage): 'shared' | 'agent' | undefined {
 // credential), so unlike every other route here, this one refuses
 // outright when LOOPENGINE_ADMIN_AUTH isn't set at all, rather than just
 // warning at startup and proceeding open like the rest of this file does
-// (see loopengine's own ABILITIES.md, "Managing ability secrets in the
-// Admin UI" — LOOPENGINE_ADMIN_AUTH being optional today is an
-// acceptable gap for config, not for secrets).
+// (see ABILITIES.md's "Managing ability secrets in the Admin UI" for why:
+// LOOPENGINE_ADMIN_AUTH being optional today is an acceptable gap for
+// config, not for secrets).
 async function handleEnvPut(req: IncomingMessage, res: ServerResponse, agentName: string, varName: string): Promise<void> {
   if (!secretsProtected) {
     res.writeHead(403, { 'content-type': 'application/json' }).end(
@@ -2261,8 +2251,8 @@ async function handleEnvPut(req: IncomingMessage, res: ServerResponse, agentName
   }
   const declaredRows = listDeclaredEnvVars(agentName).filter((v) => v.name === varName)
   // A shared value for an agent-scoped var would never be read
-  // (loopengine's createAgentEnv never falls back for one) — refuse it
-  // rather than accept a write that silently does nothing.
+  // (core/agent-env.ts's createAgentEnv never falls back for one) —
+  // refuse it rather than accept a write that silently does nothing.
   if (slot === 'shared' && declaredRows.some((v) => v.scope === 'agent')) {
     res.writeHead(400, { 'content-type': 'application/json' }).end(
       JSON.stringify({ error: `${varName} is declared scope 'agent' — set it per agent (slot=agent), not project-wide.` }),
@@ -2376,7 +2366,7 @@ async function handleAbilitiesGet(res: ServerResponse, agentName: string): Promi
 }
 
 // Backs the Apps tab's search box — proxies to npm's own public
-// registry search (loopengine's own searchPublicAbilities) so the
+// registry search (abilities-admin.ts's searchPublicAbilities) so the
 // browser never needs direct access to registry.npmjs.org, and the
 // actual query text (the loopengine-ability keyword filter) stays a
 // server-side detail rather than something the client has to know to
@@ -2496,15 +2486,15 @@ async function handleAbilityUninstallDelete(res: ServerResponse, agentName: stri
 const execFileAsync = promisify(execFile)
 const NPM_INSTALL_DEPS_TIMEOUT_MS = 180_000
 
-// Runs npm install <deps> in the project's own root (process.cwd(),
-// same convention loopengine's own env-admin.ts already establishes) —
-// the real npm packages an installed ability's tool code imports (e.g.
-// sharp, jszip) that installAbility itself never touches (it only ever
-// copies the ability's own files, deliberately never package.json/
-// node_modules — see installAbility's own doc comment). Meaningfully
-// more consequential than installing an ability's files: this mutates
-// the whole project's package.json/lockfile and runs arbitrary npm
-// lifecycle scripts, so same refuse-outright-without-
+// Runs `npm install <deps>` in the project's own root (process.cwd(),
+// same convention web/env-admin.ts's own envFilePath() already
+// establishes) — the real npm packages an installed ability's tool code
+// imports (e.g. sharp, jszip) that installAbility itself never touches
+// (it only ever copies the ability's own files, deliberately never
+// package.json/node_modules — see installAbility's own doc comment).
+// Meaningfully more consequential than installing an ability's files:
+// this mutates the whole project's package.json/lockfile and runs
+// arbitrary npm lifecycle scripts, so same refuse-outright-without-
 // LOOPENGINE_ADMIN_AUTH posture as installing/upgrading an ability
 // itself. `deps` is read back off this ability's own persisted
 // provenance record (InstalledAbilityRecord.dependencies), never taken
@@ -3145,10 +3135,10 @@ async function handleMessagesStream(req: IncomingMessage, res: ServerResponse, a
 // default. A real deployment opts in by setting it; either way, a
 // startup warning makes "I forgot to set this" loud instead of silent.
 const adminAuth = process.env.LOOPENGINE_ADMIN_AUTH
-// Hosted mode (see loopengine's core/trusted-proxy.ts): every request
-// must carry an X-LoopEngine-Identity header signed with this secret by
-// the router in front of this server. Unset (the default, and every
-// self-hosted install) means this file behaves exactly as it always has.
+// Hosted mode (see core/trusted-proxy.ts): every request must carry an
+// X-LoopEngine-Identity header signed with this secret by the router in
+// front of this server. Unset (the default, and every self-hosted
+// install) means this file behaves exactly as it always has.
 const trustedProxySecret = process.env.LOOPENGINE_TRUSTED_PROXY_SECRET
 // Routes that write secrets or install code refuse to run on a server
 // with no auth at all — either form of auth counts.
@@ -3492,11 +3482,12 @@ async function respondAfterResolutionNow(res: ServerResponse, finalCheckpoint: T
 // characters) that an agent's own reply has to reproduce character-for-
 // character to embed as a markdown image/link — expensive in output
 // tokens, slow to generate, and one flipped character anywhere in it
-// breaks the whole thing. This route lets a tool return a short, stable
-// object reference instead — bucket + object name, both human-readable,
-// not random — and defer the actual signing to request time, right
-// here, freshly, on every click: shorter for the model to write,
-// nothing random left to transcribe wrong, and a much shorter
+// breaks the whole thing (see core/known-urls.ts's own doc comment on
+// why that happens at all). This route lets a tool return a short,
+// stable object reference instead — bucket + object name, both
+// human-readable, not random — and defer the actual signing to request
+// time, right here, freshly, on every click: shorter for the model to
+// write, nothing random left to transcribe wrong, and a much shorter
 // signed-URL lifetime than an ability calling getSignedUrl itself at
 // generation time ever needed (this one only has to stay valid for as
 // long as the click that requested it takes to resolve, not however
@@ -3505,15 +3496,15 @@ async function respondAfterResolutionNow(res: ServerResponse, finalCheckpoint: T
 // Deliberately generic on two axes, not tied to any one ability or
 // cloud provider: any ability can point a tool's own returned URL here
 // instead of signing itself, as long as it authenticates the same way
-// loopengine's own storageSigners.gcs already does
-// (GOOGLE_APPLICATION_CREDENTIALS_JSON, falling back to Application
-// Default Credentials) — that's the same logic
-// lp-product-ad-images'/lp-file-archiver's own buildGcsStorageClient
-// already duplicate for the *upload* side, centralized in loopengine
-// core for signing instead. `provider` picks which one of
-// loopengine's own storageSigners actually does the signing (only
-// `gcs` exists today) — adding S3/Azure/etc. later is a loopengine
-// core change, not something this scaffolded file needs to know about.
+// core/storage-signers/gcs.ts already does (GOOGLE_APPLICATION_CREDENTIALS_JSON,
+// falling back to Application Default Credentials) — that's the same
+// logic lp-product-ad-images'/lp-file-archiver's own
+// buildGcsStorageClient already duplicate for the *upload* side,
+// centralized here for signing instead. `provider` picks which one of
+// core/storage-signers' own small, independent modules actually does
+// the signing (only `gcs` exists today) — adding S3/Azure/etc. later is
+// a new module there plus one registry entry, not a change to this
+// route or its own URL shape; see that module's own doc comment.
 //
 // Sits behind the same isAuthorized() Basic Auth gate every other route
 // on this server already requires (checked once, unconditionally,
@@ -3686,7 +3677,7 @@ async function handleActivityGet(res: ServerResponse): Promise<void> {
   )
 }
 
-// A decision link (loopengine's core/approval-links.ts): GET shows the decision page,
+// A decision link (core/approval-links.ts): GET shows the decision page,
 // POST makes the decision. The signed token is the credential, so these
 // sit outside the admin login on purpose — the link is meant for
 // whoever gets the notification, not only admins.
@@ -4315,7 +4306,6 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ fired: await scheduler.tick() }))
       return
     }
-
     lastRequestAt = Date.now()
 
     const streamMatch = req.method === 'POST' && pathname.match(/^\/agents\/([^/]+)\/messages\/stream$/)
@@ -4506,7 +4496,7 @@ const server = createServer(async (req, res) => {
         return
       }
       res.writeHead(200, { 'content-type': 'application/json' }).end(
-        JSON.stringify({ agents: listAgents().map((name) => ({ name, systemPrompt: getEntry(name)!.config.systemPrompt })) }),
+        JSON.stringify({ agents: listAgents().map((name) => ({ name, ...(getEntry(name)!.config.displayName ? { displayName: getEntry(name)!.config.displayName } : {}), systemPrompt: getEntry(name)!.config.systemPrompt })) }),
       )
       return
     }
@@ -5222,8 +5212,9 @@ async function warmAgentTools(): Promise<void> {
 //
 // This only protects the *connection* a request/stream is running
 // over. A tool's own background work that isn't awaited by its
-// execute() call (e.g. a batch job that returns a job_id immediately
-// and keeps working after) isn't tied to any connection at all, and
+// execute() call (lp-product-ad-images' own generate_google_ad_images,
+// which returns a job_id immediately and keeps generating after — see
+// that tool's own doc comment) isn't tied to any connection at all, and
 // still dies the instant process.exit runs regardless of how long this
 // grace period is — there's no persistent job queue here surviving a
 // process restart, just this one process's own event loop.
