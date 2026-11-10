@@ -21,7 +21,7 @@ export const config: AgentConfig = {
   tools,
   // Reads OPENAI_API_KEY: set it on the console's Models page, or in .env.
   // For another provider, change `provider` and `model` (e.g.
-  // { provider: 'anthropic', model: 'claude-sonnet-5' } with
+  // { provider: 'anthropic', model: 'claude-sonnet-5-5' } with
   // ANTHROPIC_API_KEY). reasoningEffort 'none' lets this gpt-5.x model use
   // function tools; see AgentModelConfig in loopengine's agent-config.
   model: { provider: 'openai', model: 'gpt-5.6-luna', reasoningEffort: 'none' },
