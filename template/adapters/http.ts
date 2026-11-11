@@ -13,12 +13,12 @@
 //   # entirely for a fresh one-off session (see defaultSessionIdFor
 //   # below) — either way the response body echoes back whichever
 //   # sessionId was actually used
-//   curl -X POST localhost:8787/agents/example-agent/messages \
+//   curl -X POST localhost:8787/agents/personal-agent/messages \
 //     -H 'content-type: application/json' \
 //     -d '{"message":"what is the weather in Boston?"}'
 //
 //   # same request, but as it happens: one SSE event per loop step
-//   curl -N -X POST localhost:8787/agents/example-agent/messages/stream \
+//   curl -N -X POST localhost:8787/agents/personal-agent/messages/stream \
 //     -H 'content-type: application/json' \
 //     -d '{"message":"what is the weather in Boston?"}'
 //
@@ -35,7 +35,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, resolve as resolvePath, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import { getEntry, listAgents, projectDir, registerAgent, updateAgent, type RegistryEntry } from '../agent-registry.js'
+import { getEntry, listAgents, projectDir, registerAgent, unregisterAgent, updateAgent, type RegistryEntry } from '../agent-registry.js'
 import {
   loadAgentModule,
   synthesizeCreateModelCall,
@@ -237,6 +237,7 @@ import {
   WorkflowError,
   checkWorkflowRequirements,
   createWorkflow,
+  forgetAgent,
   forgetWorkflow,
   getPlanJob,
   listAgentWorkflows,
@@ -1740,6 +1741,26 @@ function parseEditModelExtras(
     model.reasoningEffort = rawModel.reasoningEffort
   }
   return { ok: true, value: model }
+}
+
+// DELETE /agents/:name {confirm: "<name>"} — the Advanced tab's Delete
+// agent. The name must be sent back as `confirm`, so a stray request
+// can't delete one. See workflow-admin.ts's forgetAgent for what goes.
+async function handleDeleteAgent(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+  }
+  if (!getEntry(agentName)) return json(404, { error: `unknown agent '${agentName}'` })
+  if (!secretsProtected) return json(403, { error: 'Deleting an agent needs LOOPENGINE_ADMIN_AUTH set first.' })
+  const body = await readJsonBody(req)
+  if (body.confirm !== agentName) return json(400, { error: `Type the agent's name, ${agentName}, to delete it.` })
+  try {
+    const forgotten = await forgetAgent(agentName, agentDir(agentName))
+    unregisterAgent(agentName)
+    return json(200, { deleted: agentName, ...forgotten })
+  } catch (err) {
+    return json(err instanceof WorkflowError ? 400 : 500, { error: err instanceof Error ? err.message : String(err) })
+  }
 }
 
 async function handleEditAgent(req: IncomingMessage, res: ServerResponse, agentName: string): Promise<void> {
@@ -4583,6 +4604,11 @@ const server = createServer(async (req, res) => {
     const editAgentMatch = req.method === 'PUT' && pathname.match(/^\/agents\/([^/]+)$/)
     if (editAgentMatch) {
       await handleEditAgent(req, res, decodeURIComponent(editAgentMatch[1]))
+      return
+    }
+    const deleteAgentMatch = req.method === 'DELETE' && pathname.match(/^\/agents\/([^/]+)$/)
+    if (deleteAgentMatch) {
+      await handleDeleteAgent(req, res, decodeURIComponent(deleteAgentMatch[1]))
       return
     }
 

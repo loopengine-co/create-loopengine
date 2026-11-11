@@ -88,7 +88,7 @@ export function scaffold(options: ScaffoldOptions): string {
 // (base or current); projectPath is where the *scaffolded* copy lives —
 // only differs for _gitignore, which scaffold() renames to .gitignore
 // (see its own comment for why the template can't ship it under that
-// name directly). Deliberately narrow: agents/example-agent/** stops
+// name directly). Deliberately narrow: agents/personal-agent/** stops
 // being "template" the instant someone builds a real agent on top of it,
 // and package.json's own dependency versions are a separate, simpler
 // `npm install loopengine@latest` left to the operator rather than

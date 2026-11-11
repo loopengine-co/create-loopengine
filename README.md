@@ -21,7 +21,7 @@ npm run dev             # HTTP server on :8787
 ```
 
 ```bash
-curl -X POST localhost:8787/agents/example-agent/messages \
+curl -X POST localhost:8787/agents/personal-agent/messages \
   -H 'content-type: application/json' \
   -d '{"message":"what is the weather in Boston?"}'
 ```
@@ -33,7 +33,7 @@ it in explicitly on a later request to continue that same conversation).
 Or from the command line directly, no server needed:
 
 ```bash
-npm run cli -- --agent example-agent "what is the weather in Boston?"
+npm run cli -- --agent personal-agent "what is the weather in Boston?"
 ```
 
 No name given? `npx create-loopengine@latest` on its own scaffolds into
@@ -47,7 +47,7 @@ A real, standalone project — its own `package.json` depending on
 ```
 package.json             Depends on loopengine — your project, not a fork
 agent-registry.ts         Auto-discovers agents/*.ts by AgentConfig.name — nothing to edit here
-agents/example-agent.ts   Starter agent: persona, one tool, one permission rule
+agents/personal-agent.ts   Starter agent: persona, one tool, one permission rule
 adapters/http.ts          HTTP API (streaming + non-streaming), routes by agent name
 adapters/cli.ts           Command-line adapter
 .env.example              ANTHROPIC_API_KEY / OPENAI_API_KEY / REDIS_URL
@@ -55,7 +55,7 @@ adapters/cli.ts           Command-line adapter
 ```
 
 The registry is multi-agent-capable from the start — seeded with one
-example agent, not architecturally limited to one — built on loopengine's
+personal agent, not architecturally limited to one — built on loopengine's
 own `discoverAgents`: it scans `agents/` and keys each entry by
 `AgentConfig.name`, not the filename, so adding a second agent later is
 one new file, not a rewrite and not a registry edit either. See
@@ -66,7 +66,7 @@ Kimi, GLM, or Gemini — all six included).
 
 ## Add another agent
 
-1. Copy `agents/example-agent.ts` to `agents/your-agent.ts` and edit its
+1. Copy `agents/personal-agent.ts` to `agents/your-agent.ts` and edit its
    `name`, `systemPrompt`, `tools`, and `rules`.
 2. That's it — `agent-registry.ts` discovers it automatically, no
    registration step.

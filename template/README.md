@@ -16,7 +16,7 @@ npm run dev             # HTTP server on :8787
 ```
 
 ```bash
-curl -X POST localhost:8787/agents/example-agent/messages \
+curl -X POST localhost:8787/agents/personal-agent/messages \
   -H 'content-type: application/json' \
   -d '{"message":"what is the weather in Boston?"}'
 ```
@@ -28,7 +28,7 @@ it in explicitly on a later request to continue that same conversation).
 Or from the command line directly, no server needed:
 
 ```bash
-npm run cli -- --agent example-agent "what is the weather in Boston?"
+npm run cli -- --agent personal-agent "what is the weather in Boston?"
 ```
 
 ## Admin UI
@@ -50,7 +50,7 @@ reachable by anyone but you (see `.env.example`).
 
 ## Add another agent
 
-1. Copy `agents/example-agent/` to `agents/your-agent/` — `index.ts`
+1. Copy `agents/personal-agent/` to `agents/your-agent/` — `index.ts`
    (persona + which tools), `tools/` (one file per tool), `actauth.yml`
    (the permission story), and `skills/` if it needs any.
 2. Edit `index.ts`'s `name` and `systemPrompt`, and `tools/index.ts`'s
@@ -63,7 +63,7 @@ reachable by anyone but you (see `.env.example`).
 4. Call it at `/agents/your-agent/messages`.
 
 `loopengine`'s own CLI scaffolds this same folder shape for you, if you'd
-rather start empty than copy `example-agent/`:
+rather start empty than copy `personal-agent/`:
 
 ```bash
 npx loopengine add-agent your-agent
@@ -102,10 +102,10 @@ reaching for this.
 
 ```
 agent-registry.ts                Auto-discovers agents/* by AgentConfig.name — nothing to edit here
-agents/example-agent/index.ts    Starter agent: persona, one tool
-agents/example-agent/tools/      One tool (get_weather), aggregated in tools/index.ts
-agents/example-agent/actauth.yml One permission rule (allow get_weather), default_decision: ask
-agents/example-agent/skills/     One skill (convert-temperature) — instructions, not a tool call
+agents/personal-agent/index.ts    Starter agent: persona, one tool
+agents/personal-agent/tools/      One tool (get_weather), aggregated in tools/index.ts
+agents/personal-agent/actauth.yml One permission rule (allow get_weather), default_decision: ask
+agents/personal-agent/skills/     One skill (convert-temperature) — instructions, not a tool call
 adapters/http.ts                  HTTP API (streaming + non-streaming)
 adapters/cli.ts                   Command-line adapter
 ```

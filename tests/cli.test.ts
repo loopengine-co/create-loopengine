@@ -13,7 +13,7 @@ function makeTemplate(): string {
   mkdirSync(join(templateDir, 'agents'), { recursive: true })
   writeFileSync(join(templateDir, 'package.json'), JSON.stringify({ name: '__PROJECT_NAME__', private: true }))
   writeFileSync(join(templateDir, 'README.md'), '# __PROJECT_NAME__\n')
-  writeFileSync(join(templateDir, 'agents', 'example-agent.ts'), 'export const config = {}\n')
+  writeFileSync(join(templateDir, 'agents', 'personal-agent.ts'), 'export const config = {}\n')
   // Ships as `_gitignore`, not `.gitignore` — npm strips a real .gitignore
   // (even nested ones) when publishing, so scaffold() renames it back after
   // copying. The fixture mirrors the real template/_gitignore for that reason.
@@ -30,7 +30,7 @@ describe('scaffold', () => {
     const result = scaffold({ name: 'my-agents', destinationDir: destination, templateDir })
 
     expect(result).toBe(destination)
-    expect(existsSync(join(destination, 'agents', 'example-agent.ts'))).toBe(true)
+    expect(existsSync(join(destination, 'agents', 'personal-agent.ts'))).toBe(true)
     expect(JSON.parse(readFileSync(join(destination, 'package.json'), 'utf8')).name).toBe('my-agents')
     expect(readFileSync(join(destination, 'README.md'), 'utf8')).toContain('# my-agents')
   })

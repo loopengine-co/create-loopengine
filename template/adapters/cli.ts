@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Channel adapter #1: command line.
 //
-//   npm run cli -- --agent example-agent "what's the weather in Boston?"
+//   npm run cli -- --agent personal-agent "what's the weather in Boston?"
 //
 // Omit --session for a one-off ask — each such call gets its own fresh,
 // isolated session (a random id, printed to stderr so it can be reused
@@ -9,7 +9,7 @@
 // conversation). Pass --session explicitly to have two calls share one
 // ongoing conversation on purpose.
 //
-//   npm run cli -- --agent example-agent --json "what's the weather in Boston?"
+//   npm run cli -- --agent personal-agent --json "what's the weather in Boston?"
 //
 // --json prints the same typed LoopEvent stream adapters/http.ts's SSE
 // route sends as one JSON object per line on stdout, ending with a

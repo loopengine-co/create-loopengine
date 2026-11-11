@@ -16,8 +16,8 @@ import type { AgentConfig } from 'loopengine'
 import { tools } from './tools/index.js'
 
 export const config: AgentConfig = {
-  name: 'example-agent',
-  systemPrompt: 'You are a helpful assistant.',
+  name: 'personal-agent',
+  systemPrompt: 'You are a helpful personal assistant.',
   tools,
   // Reads OPENAI_API_KEY: set it on the console's Models page, or in .env.
   // For another provider, change `provider` and `model` (e.g.
