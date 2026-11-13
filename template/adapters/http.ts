@@ -58,6 +58,7 @@ import {
   type AgentModelConfig,
   type ToolDefinition,
   type Message,
+  type ModelCall,
   type ModelContentBlock,
   type RunAgentResult,
   SkillGarden,
@@ -152,6 +153,7 @@ import {
   renderDecideInvalidPage,
   renderDecidePage,
   agentApprovers,
+  agentMessagingIdentities,
   agentTelegramWebhookInfo,
   announceToNotifier,
   clickAllowed,
@@ -253,6 +255,25 @@ import {
   type WorkflowAppStatus,
   type WorkflowMcpDeps,
   workflowPageHtml,
+  goalsPageHtml,
+  setPlaybookProjectDir,
+  startPlaybookSync,
+  GoalError,
+  checkBuiltWorkflows,
+  createGoal,
+  deleteGoal,
+  generateMore,
+  getGoal,
+  goalContextFrom,
+  listGoals,
+  markBuilt,
+  prepareBuild,
+  readGoalSettings,
+  setWorkflowState,
+  writeGoalSettings,
+  type GoalsDeps,
+  sharesLeverStats,
+  startLeverEventsSync,
   MAX_UPLOAD_BYTES,
   installUploadedAbility,
   installWorkspaceAbility,
@@ -1156,6 +1177,90 @@ async function handleInterviews(req: IncomingMessage, res: ServerResponse, pathn
   }
 }
 
+// Goals (web/goals-admin.ts): a goal, the workflows the goal planner
+// suggests for it, saving, discarding and building them.
+// The goal planner's model: gpt-6.1-sol when an OpenAI key is set (it
+// plans best in the evals, tests/evals/), else an agent's model with its
+// key, else any provider with a key, so a workspace with no agents yet
+// can still plan.
+async function goalModelCall(): Promise<ModelCall> {
+  const candidates: AgentModelConfig[] = []
+  if (process.env.OPENAI_API_KEY) candidates.push({ provider: 'openai', model: 'gpt-6.1-sol' } as AgentModelConfig)
+  try {
+    const picked = pickInterviewModel(interviewAgents())
+    if (picked) candidates.push(picked.model as AgentModelConfig)
+  } catch {}
+  if (process.env.ANTHROPIC_API_KEY) candidates.push({ provider: 'anthropic', model: 'claude-opus-5-5' } as AgentModelConfig)
+  if (process.env.DEEPSEEK_API_KEY) candidates.push({ provider: 'deepseek', model: 'deepseek-v4-flash' } as AgentModelConfig)
+  for (const model of candidates) {
+    try {
+      return (await synthesizeCreateModelCall({ ...model, maxTokens: 16000 } as AgentModelConfig))()
+    } catch {}
+  }
+  throw new GoalError('No model is ready to plan with: add a key under Models (an OpenAI key plans with gpt-6.1-sol).')
+}
+
+const goalsDeps: GoalsDeps = {
+  projectDir: () => projectDir(),
+  modelCall: goalModelCall,
+  context: async (about) => goalContextFrom({ about, agents: await workflowAgentInfo(), apps: workflowApps() }),
+  agentExists: (name) => Boolean(getEntry(name)),
+  workflowActivity: async (agent, workflowId, sinceIso) => {
+    if (!getEntry(agent) || !readWorkflow(agentDir(agent), workflowId)) return { exists: false, runs: 0, done: 0 }
+    const runs = (await listRuns(agent, { workflowId, limit: 500 })).filter((r) => r.started_at >= sinceIso)
+    return { exists: true, runs: runs.length, done: runs.filter((r) => r.status === 'done').length }
+  },
+  createAgent: async (name, instructions) => {
+    let model: AgentModelConfig | undefined
+    try {
+      model = pickInterviewModel(interviewAgents())?.model as AgentModelConfig | undefined
+    } catch {}
+    if (!model && process.env.OPENAI_API_KEY) model = { provider: 'openai', model: 'gpt-6-luna' } as AgentModelConfig
+    const parsed = parseAgentTemplateOptions({ systemPrompt: instructions, ...(model ? { model } : {}) })
+    if (!parsed.ok) throw new GoalError(parsed.error)
+    const indexPath = await scaffoldAgent(projectDir(), name, parsed.value)
+    registerAgent(await loadAgentModule(indexPath, indexPath))
+  },
+}
+
+async function handleGoals(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+  }
+  // /goals, /goals/about, /goals/<id>, /goals/<id>/generate,
+  // /goals/<id>/workflows/<wid>[/build|/built]
+  const [, , id, sub, wid, action] = pathname.split('/')
+  try {
+    if (!id && req.method === 'GET') {
+      const settings = readGoalSettings(goalsDeps)
+      return json(200, { goals: listGoals(goalsDeps), about: settings.about, settings: { ...settings, shareLeverStats: sharesLeverStats(projectDir()), cloud: Boolean(process.env.LOOPENGINE_TRUSTED_PROXY_SECRET) } })
+    }
+    if (!id && req.method === 'POST') return json(200, { goal: createGoal(goalsDeps, await readJsonBody(req)) })
+    if (id === 'about' && req.method === 'PUT') {
+      const settings = writeGoalSettings(goalsDeps, await readJsonBody(req))
+      return json(200, { about: settings.about, settings: { ...settings, shareLeverStats: sharesLeverStats(projectDir()) } })
+    }
+    if (id && !sub && req.method === 'GET') return json(200, { goal: getGoal(goalsDeps, id) })
+    if (id && !sub && req.method === 'DELETE') {
+      deleteGoal(goalsDeps, id)
+      return json(200, { deleted: true })
+    }
+    if (id && sub === 'generate' && req.method === 'POST') return json(200, { goal: generateMore(goalsDeps, id, await readJsonBody(req)) })
+    if (id && sub === 'workflows' && wid && !action && req.method === 'PATCH') {
+      const body = await readJsonBody(req)
+      return json(200, { goal: setWorkflowState(goalsDeps, id, wid, body.action, body.reason) })
+    }
+    if (id && sub === 'workflows' && wid && action === 'build' && req.method === 'POST') return json(200, await prepareBuild(goalsDeps, id, wid))
+    if (id && sub === 'workflows' && wid && action === 'built' && req.method === 'POST') return json(200, { goal: markBuilt(goalsDeps, id, wid, await readJsonBody(req)) })
+    return json(404, { error: 'not found' })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (err instanceof GoalError || err instanceof AgentNameError || err instanceof AgentExistsError || err instanceof AgentModelError) return json(message === 'No such goal' ? 404 : 400, { error: message })
+    console.error('[loopengine] goals failed:', err)
+    return json(500, { error: message })
+  }
+}
+
 // "Describe a workflow" (web/workflow-admin.ts): what the planner and the
 // checks know about each agent: its tools, abilities, rules and primary
 // messaging app.
@@ -1628,7 +1733,7 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
     // A planning job's progress (the page checks every few seconds).
     if (action === 'plan' && jobId && req.method === 'GET') {
       const job = getPlanJob(jobId)
-      return job ? json(200, job) : json(404, { error: 'No such planning job (it may have expired); plan it again.' })
+      return job ? json(200, job) : json(404, { error: 'This draft is no longer available (it may have expired); build it again.' })
     }
     if (action === 'plan' && !jobId && req.method === 'POST') {
       if (!picked) return json(409, { error: 'No model is ready to plan with: set one on an agent (Overview → Model) and add its key under Models.' })
@@ -4737,6 +4842,15 @@ const server = createServer(async (req, res) => {
       return
     }
     // "Find your first agent": the page, and its routes.
+    // The Goals page (a browser asking for a page), and its API.
+    if (req.method === 'GET' && pathname === '/goals' && String(req.headers.accept ?? '').includes('text/html')) {
+      res.writeHead(200, { 'content-type': 'text/html' }).end(goalsPageHtml)
+      return
+    }
+    if (pathname === '/goals' || pathname.startsWith('/goals/')) {
+      await handleGoals(req, res, pathname)
+      return
+    }
     if (req.method === 'GET' && pathname === '/interview') {
       res.writeHead(200, { 'content-type': 'text/html' }).end(interviewPageHtml)
       return
@@ -5063,6 +5177,14 @@ const server = createServer(async (req, res) => {
 
     // Backs the console's Approvals section and polling clients — see
     // handleNotifierGet/handlePendingGet above.
+    // Messaging tab: which bot each saved app connects as.
+    const identitiesMatch = req.method === 'GET' && pathname.match(/^\/agents\/([^/]+)\/notifier\/identities$/)
+    if (identitiesMatch) {
+      const entry = getEntry(decodeURIComponent(identitiesMatch[1]))
+      if (!entry) { res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'unknown agent' })); return }
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(await agentMessagingIdentities(entry.config)))
+      return
+    }
     const notifierMatch = pathname.match(/^\/agents\/([^/]+)\/notifier$/)
     if (notifierMatch && req.method === 'GET') {
       handleNotifierGet(res, decodeURIComponent(notifierMatch[1]))
@@ -5396,6 +5518,16 @@ const port = Number(process.env.PORT ?? 8787)
 server.listen(port, () => {
   console.log(`agent API listening on :${port}`)
   void warmAgentTools()
+  // The goal planner's playbook: the bundled one, plus the latest one a
+  // Cloud workspace fetches daily (core/playbook-sync.ts).
+  setPlaybookProjectDir(projectDir())
+  startPlaybookSync(projectDir(), (m) => console.log(m))
+  // Lever events: built goal workflows checked daily (kept, used,
+  // removed), and sent to loopengine.co while sharing is on.
+  const checkGoals = () => void checkBuiltWorkflows(goalsDeps).catch((err) => console.error('[loopengine] checking goal workflows failed:', err))
+  checkGoals()
+  setInterval(checkGoals, 24 * 60 * 60 * 1000).unref()
+  startLeverEventsSync(projectDir(), (m) => console.log(m))
   // LOOPENGINE_SCHEDULER=off leaves scheduling to another process.
   // Workflows from before they were skills move into their skills first,
   // so their schedules run them.
