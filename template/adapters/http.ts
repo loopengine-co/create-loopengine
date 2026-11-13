@@ -109,6 +109,7 @@ import {
   readWorkflow,
   readWorkflows,
   validateParams,
+  workflowPreviewMessage,
   workflowRunMessage,
   substituteParameters,
   WorkflowRunner,
@@ -1801,6 +1802,20 @@ async function handleAgentWorkflows(req: IncomingMessage, res: ServerResponse, a
         if (Date.now() >= deadline) return json(202, { runId: run.run_id, running: true })
         await new Promise((r) => setTimeout(r, 300))
       }
+    }
+    // The editor's Preview: the first message a run would get from the
+    // unsaved edits, with sample values. Nothing is saved.
+    if (id && action === 'preview' && req.method === 'POST') {
+      const saved = readWorkflow(dir, id)
+      if (!saved) return json(404, { error: `No workflow ${id}.` })
+      const body = await readJsonBody(req)
+      const instructions = typeof body.instructions === 'string' ? body.instructions.trim() : saved.instructions
+      const raw = body.parameters && typeof body.parameters === 'object' && !Array.isArray(body.parameters) ? (body.parameters as Record<string, { description?: unknown }>) : undefined
+      const parameters = raw
+        ? Object.fromEntries(Object.entries(raw).filter(([name]) => /^[a-z_][a-z0-9_]*$/.test(name)).map(([name, p]) => [name, { description: typeof p?.description === 'string' ? p.description : '', required: false }]))
+        : saved.parameters
+      const title = typeof body.title === 'string' && body.title.trim() ? body.title.trim() : saved.title
+      return json(200, { message: workflowPreviewMessage({ ...saved, title, startMessage: '', steps: instructions, instructions, parameters }) })
     }
     if (id && !action && req.method === 'PUT') {
       updateWorkflow(dir, id, await readJsonBody(req))
@@ -4765,7 +4780,7 @@ const server = createServer(async (req, res) => {
       await handleWorkflowTriggers(req, res, decodeURIComponent(triggersMatch[1]), triggersMatch[2], triggersMatch[3], triggersMatch[4])
       return
     }
-    const agentWorkflowsMatch = pathname.match(/^\/agents\/([^/]+)\/workflows(?:\/([a-z0-9-]+))?(?:\/(run|runs))?$/)
+    const agentWorkflowsMatch = pathname.match(/^\/agents\/([^/]+)\/workflows(?:\/([a-z0-9-]+))?(?:\/(run|runs|preview))?$/)
     if (agentWorkflowsMatch) {
       await handleAgentWorkflows(req, res, decodeURIComponent(agentWorkflowsMatch[1]), agentWorkflowsMatch[2], agentWorkflowsMatch[3])
       return
