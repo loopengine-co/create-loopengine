@@ -266,10 +266,12 @@ import {
   type WorkflowMcpDeps,
   workflowPageHtml,
   goalsPageHtml,
+  activePlaybook,
   setPlaybookProjectDir,
   startPlaybookSync,
   GoalError,
   acceptJob,
+  addJob,
   assignJob,
   chainedRuns,
   editJob,
@@ -1268,7 +1270,8 @@ async function handleGoals(req: IncomingMessage, res: ServerResponse, pathname: 
   try {
     if (!id && req.method === 'GET') {
       const settings = readGoalSettings(goalsDeps)
-      return json(200, { goals: listGoals(goalsDeps), about: settings.about, settings: { ...settings, shareLeverStats: sharesLeverStats(projectDir()), cloud: Boolean(process.env.LOOPENGINE_TRUSTED_PROXY_SECRET) } })
+      // The focuses in use (the playbook's and this workspace's own), for the page's Focus choice.
+      return json(200, { goals: listGoals(goalsDeps), about: settings.about, settings: { ...settings, shareLeverStats: sharesLeverStats(projectDir()), cloud: Boolean(process.env.LOOPENGINE_TRUSTED_PROXY_SECRET) }, focuses: activePlaybook().focuses })
     }
     if (!id && req.method === 'POST') return json(200, { goal: createGoal(goalsDeps, await readJsonBody(req)) })
     if (id === 'about' && req.method === 'PUT') {
@@ -1286,6 +1289,11 @@ async function handleGoals(req: IncomingMessage, res: ServerResponse, pathname: 
       // A recurring job's workflows and chain; else what the person did with it.
       if (body.action === 'link' || body.action === 'unlink' || body.action === 'chain') return json(200, await view(editJob(goalsDeps, id, wid, body)))
       return json(200, await view(setWorkflowState(goalsDeps, id, wid, body.action, body.reason)))
+    }
+    // A job the person adds in their own words, shaped and judged by the planner.
+    if (id && jobs && !wid && req.method === 'POST') {
+      const added = await addJob(goalsDeps, id, await readJsonBody(req))
+      return json(200, { ...(await view(added.goal)), verdict: added.verdict, note: added.note, alternative: added.alternative, ...(added.jobId ? { jobId: added.jobId } : {}) })
     }
     if (id && jobs && wid && action === 'assign' && req.method === 'POST') return json(200, await view(await assignJob(goalsDeps, id, wid, await readJsonBody(req))))
     if (id && jobs && wid && action === 'accept' && req.method === 'POST') return json(200, await view(await acceptJob(goalsDeps, id, wid)))
