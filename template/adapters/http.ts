@@ -269,6 +269,10 @@ import {
   setPlaybookProjectDir,
   startPlaybookSync,
   GoalError,
+  acceptJob,
+  assignJob,
+  goalView,
+  type Goal,
   checkBuiltWorkflows,
   createGoal,
   deleteGoal,
@@ -1231,6 +1235,16 @@ const goalsDeps: GoalsDeps = {
     const indexPath = await scaffoldAgent(projectDir(), name, parsed.value)
     registerAgent(await loadAgentModule(indexPath, indexPath))
   },
+  // A once job assigned to its agent: one unattended run, recorded like a
+  // workflow run (source "assignment").
+  startAssignment: async (agent, message, job) => {
+    const run = await workflowRunner.start({ agent, workflow_id: '', source: 'assignment', message, job })
+    return { runId: run.run_id }
+  },
+  assignmentRun: async (agent, runId) => {
+    const run = await getRun(agent, runId)
+    return run && { status: run.status, ...(run.result ? { result: run.result } : {}), ...(run.error ? { error: run.error } : {}) }
+  },
 }
 
 async function handleGoals(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
@@ -1238,10 +1252,12 @@ async function handleGoals(req: IncomingMessage, res: ServerResponse, pathname: 
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
   }
   // /goals, /goals/about, /goals/<id>, /goals/<id>/generate,
-  // /goals/<id>/jobs/<jobId>[/build|/built]. A job was called a workflow
-  // under its goal before; /goals/<id>/workflows/<jobId> still works.
+  // /goals/<id>/jobs/<jobId>[/build|/built|/assign|/accept]. A job was
+  // called a workflow under its goal before; /goals/<id>/workflows/<jobId>
+  // still works. A goal comes back with its once jobs' tries.
   const [, , id, sub, wid, action] = pathname.split('/')
   const jobs = sub === 'jobs' || sub === 'workflows'
+  const view = async (goal: Goal) => ({ goal: await goalView(goalsDeps, goal) })
   try {
     if (!id && req.method === 'GET') {
       const settings = readGoalSettings(goalsDeps)
@@ -1252,16 +1268,18 @@ async function handleGoals(req: IncomingMessage, res: ServerResponse, pathname: 
       const settings = writeGoalSettings(goalsDeps, await readJsonBody(req))
       return json(200, { about: settings.about, settings: { ...settings, shareLeverStats: sharesLeverStats(projectDir()) } })
     }
-    if (id && !sub && req.method === 'GET') return json(200, { goal: getGoal(goalsDeps, id) })
+    if (id && !sub && req.method === 'GET') return json(200, await view(getGoal(goalsDeps, id)))
     if (id && !sub && req.method === 'DELETE') {
       deleteGoal(goalsDeps, id)
       return json(200, { deleted: true })
     }
-    if (id && sub === 'generate' && req.method === 'POST') return json(200, { goal: generateMore(goalsDeps, id, await readJsonBody(req)) })
+    if (id && sub === 'generate' && req.method === 'POST') return json(200, await view(generateMore(goalsDeps, id, await readJsonBody(req))))
     if (id && jobs && wid && !action && req.method === 'PATCH') {
       const body = await readJsonBody(req)
-      return json(200, { goal: setWorkflowState(goalsDeps, id, wid, body.action, body.reason) })
+      return json(200, await view(setWorkflowState(goalsDeps, id, wid, body.action, body.reason)))
     }
+    if (id && jobs && wid && action === 'assign' && req.method === 'POST') return json(200, await view(await assignJob(goalsDeps, id, wid, await readJsonBody(req))))
+    if (id && jobs && wid && action === 'accept' && req.method === 'POST') return json(200, await view(await acceptJob(goalsDeps, id, wid)))
     if (id && jobs && wid && action === 'build' && req.method === 'POST') return json(200, await prepareBuild(goalsDeps, id, wid))
     if (id && jobs && wid && action === 'built' && req.method === 'POST') return json(200, { goal: markBuilt(goalsDeps, id, wid, await readJsonBody(req)) })
     return json(404, { error: 'not found' })
