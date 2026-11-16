@@ -274,6 +274,7 @@ import {
   chainedRuns,
   editJob,
   goalView,
+  migrateGoalFiles,
   type Goal,
   checkBuiltWorkflows,
   createGoal,
@@ -5775,6 +5776,13 @@ server.listen(port, () => {
   // Cloud workspace fetches daily (core/playbook-sync.ts).
   setPlaybookProjectDir(projectDir())
   startPlaybookSync(projectDir(), (m) => console.log(m))
+  // Goals saved before jobs are rewritten as goals with jobs, once.
+  try {
+    const moved = migrateGoalFiles(goalsDeps)
+    if (moved) console.log(`[loopengine] moved ${moved} goal${moved === 1 ? '' : 's'} to jobs`)
+  } catch (err) {
+    console.error('[loopengine] moving goals to jobs failed:', err)
+  }
   // Lever events: built goal workflows checked daily (kept, used,
   // removed), and sent to loopengine.co while sharing is on.
   const checkGoals = () => void checkBuiltWorkflows(goalsDeps).catch((err) => console.error('[loopengine] checking goal workflows failed:', err))
