@@ -37,6 +37,7 @@ import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { getEntry, listAgents, projectDir, registerAgent, unregisterAgent, updateAgent, type RegistryEntry } from '../agent-registry.js'
 import {
+  UNATTENDED_NOTE,
   loadAgentModule,
   synthesizeCreateModelCall,
   editAgentFile,
@@ -238,7 +239,9 @@ import {
   replyInSlack,
   replyPrivatelyInSlack,
   slackArgs,
+  slackEscape,
   slackOutcomeText,
+  toSlackMrkdwn,
   verifySlackRequest,
   searchPublicAbilities,
   fetchLatestAbilityVersion,
@@ -332,6 +335,7 @@ import {
   loadAppIcons,
   refreshAppTools,
   setAppDefault,
+  appToolInputs,
   type AgentAppTools,
   AbilitySourceError,
   abilityOrigin,
@@ -1439,7 +1443,14 @@ async function workflowMcpServerTools(id: string): Promise<unknown> {
   // A connected app's tools are already known (and one connected by
   // signing in can't be listed without its sign-in).
   const existing = workflowMcp.existingFor(server.url)
-  if (existing?.tools.length) return { server: server.title, connected: true, tools: existing.tools.slice(0, 80).map((t) => ({ name: t.remote })) }
+  if (existing?.tools.length) {
+    // What each does and must be given (an account, a workspace...), so
+    // the plan includes the tool that finds it; just the names when the
+    // server can't be reached.
+    const detailed = await appToolInputs(existing.spec, (n) => process.env[n]).catch(() => undefined)
+    if (detailed?.length) return { server: server.title, connected: true, tools: detailed.slice(0, 80).map((t) => ({ name: t.remote, description: t.description.slice(0, 200), ...(t.readOnly !== undefined ? { readOnly: t.readOnly } : {}), ...(t.required.length ? { needs: t.required } : {}) })) }
+    return { server: server.title, connected: true, tools: existing.tools.slice(0, 80).map((t) => ({ name: t.remote })) }
+  }
   const { keyEnv } = mcpAbilityNames(server)
   const key = process.env[keyEnv]
   try {
@@ -1447,7 +1458,13 @@ async function workflowMcpServerTools(id: string): Promise<unknown> {
       { url: server.url, ...(server.transport === 'sse' ? { transport: 'sse' as const } : {}), auth: key ? { type: 'key', env: keyEnv, ...(server.auth ?? {}) } : { type: 'none' } },
       { get: (n) => (n === keyEnv ? key : undefined), require: (n) => { if (n === keyEnv && key) return key; throw new Error(`${n} is not set`) } },
     )
-    return { server: server.title, tools: tools.slice(0, 80).map((t) => ({ name: t.name, description: t.description.split('\n')[0].slice(0, 200), ...(t.readOnly !== undefined ? { readOnly: t.readOnly } : {}) })) }
+    return {
+      server: server.title,
+      tools: tools.slice(0, 80).map((t) => {
+        const needs = Array.isArray(t.inputSchema?.required) ? (t.inputSchema.required as unknown[]).filter((r): r is string => typeof r === 'string') : []
+        return { name: t.name, description: t.description.split('\n')[0].slice(0, 200), ...(t.readOnly !== undefined ? { readOnly: t.readOnly } : {}), ...(needs.length ? { needs } : {}) }
+      }),
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return isMcpAuthError(err)
@@ -1847,6 +1864,7 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
         addAppTools: async (agent, spec, tools) => addAgentAppTools(agent, spec, tools),
         appStatus: workflowAppStatus,
         appForSpec: workflowAppForSpec,
+        appToolInputs: (spec) => appToolInputs(spec, (n) => process.env[n]),
         mcp: {
           ...workflowMcp,
           // The planning model matches steps to the app's tools, when the
@@ -2387,10 +2405,12 @@ async function executeUnattendedRun(agent: string, message: string, rawSessionId
   const tenant = 'default'
   const environment = process.env.LOOPENGINE_ENV ?? 'production'
   const outcome = await sessions.withSession(`${tenant}:${environment}:${agent}:${rawSessionId}`, async (history) => {
-    const result = await runAgent(config, modelCall, message, history, {
+    // Nobody is in its chat: how to ask for a decision goes with it.
+    const result = await runAgent(config, modelCall, `${message}\n\n${UNATTENDED_NOTE}`, history, {
       tenant,
       sessionId: rawSessionId,
       channel: 'http',
+      unattended: true,
       approver: defaultHttpWebhookNotifier ?? { requestApproval: async () => false },
       questionHandler: defaultHttpWebhookNotifier ?? { requestQuestion: async () => NO_HUMAN_ANSWER },
     })
@@ -4014,6 +4034,8 @@ async function respondAfterResolutionNow(res: ServerResponse, finalCheckpoint: T
       approver: fromJobThread ? threadApprover : defaultHttpWebhookNotifier ?? createTrackedApprover(finalCheckpoint.sessionId),
       questionHandler: fromJobThread ? threadQuestions : defaultHttpWebhookNotifier,
       onQuestionPending: () => {},
+      // A workflow run carries on unattended after the decision.
+      ...(resumedRun && !fromJobThread ? { unattended: true } : {}),
     })
     // The resumed turn can itself hit another durably-pending call/
     // question — same wiring as the fresh-turn call sites above, or its
@@ -4357,6 +4379,17 @@ async function handleSlackInteraction(req: IncomingMessage, res: ServerResponse,
     const item = (await checkpoints.get(interaction.pendingId))?.outstanding[interaction.pendingId]
     if (item) ran = `\nRan \`${item.tool}\` with:\n${slackArgs(item.args, (await resolveAgentTool(entry.config, item.tool))?.input_schema)}`
   }
+  // The decision carries the run on, which can take minutes: the message
+  // says what was decided (and loses its buttons) straight away.
+  const waiting = (await checkpoints.get(interaction.pendingId))?.outstanding[interaction.pendingId]
+  if (waiting && interaction.responseUrl) {
+    const who = interaction.user ? ` by <@${interaction.user}>` : ''
+    const working =
+      interaction.type === 'answer' ? `*Answered${who}:* ${toSlackMrkdwn(slackEscape(interaction.answer))}. The agent is carrying on… this message updates when it's done.`
+      : interaction.decision === 'approve' ? `*Approved${who}.* Running \`${waiting.tool}\`… this message updates when it's done.`
+      : `*Denied${who}.* Letting the agent know…`
+    await replyInSlack(interaction.responseUrl, working).catch((err) => console.error('[loopengine] Slack reply failed:', err))
+  }
   const capture = captureResponse()
   if (interaction.type === 'decide') await resolvePendingApproval(capture.res, interaction.pendingId, { decision: interaction.decision })
   else await answerPendingQuestion(capture.res, interaction.pendingId, { answer: interaction.answer })
@@ -4482,11 +4515,19 @@ async function handleTelegramClick(agentName: string, entry: RegistryEntry, botT
   const deps = messagingDeps(agentName, entry, connector)
   const who = click.username ? `@${click.username}` : click.userName ?? 'someone'
   if (click.button.type === 'action') {
+    // Approving a change runs the tool and the rest of the run: say so
+    // (and take the buttons away) until it's done.
+    if (click.button.action === 'approve_edited' || click.button.action === 'confirm') {
+      await editTelegramMessage(botToken, click.conversation, click.messageId, `**Approved by ${who}.** Running it… this message updates when it's done.`)
+    }
     const text = await handleMessagingAction(click.button.action, click.pendingId, click.user, deps)
     await editTelegramMessage(botToken, click.conversation, click.messageId, text)
     return
   }
   const item = (await checkpoints.get(click.pendingId))?.outstanding[click.pendingId]
+  // The buttons are on a long request's last message, which belongs to its first.
+  const dir = agentDirFor(entry.config)
+  const request = readTelegramThread(dir, click.conversation, telegramRootOf(dir, click.conversation, click.messageId)).find((m) => m.ts === click.messageId)?.text
   let decision: MessagingDecision
   let answer: string | undefined
   if (click.button.type === 'decide') {
@@ -4501,6 +4542,16 @@ async function handleTelegramClick(agentName: string, entry: RegistryEntry, botT
       return
     }
   }
+  // The decision carries the run on, which can take minutes: the message
+  // says what was decided (and loses its buttons) straight away, then
+  // what happened once the run gets there.
+  if (item) {
+    const working =
+      decision.kind === 'approve' ? `**Approved by ${who}.** Running \`${item.tool}\`… this message updates when it's done.`
+      : decision.kind === 'deny' ? `**Denied by ${who}.** Letting the agent know…`
+      : `**Answered by ${who}:** "${telegramEscape(answer ?? '')}". The agent is carrying on… this message updates when it's done.`
+    await editTelegramMessage(botToken, click.conversation, click.messageId, request ? `${request}\n\n${working}` : working)
+  }
   const outcome = await decideFromMessaging(click.pendingId, decision)
   const kind = decision.kind === 'answer' ? 'answer' : decision.kind
   if (!outcome.error && !outcome.alreadyResolved) {
@@ -4511,7 +4562,6 @@ async function handleTelegramClick(agentName: string, entry: RegistryEntry, botT
   const settled = !outcome.error && !outcome.alreadyResolved
   let result = outcomeText(kind, who, outcome, answer === undefined ? undefined : telegramEscape(answer))
   if (kind === 'approve' && settled) result = `**Approved by ${who}.** ${result}`
-  const request = readTelegramThread(agentDirFor(entry.config), click.conversation, click.messageId).find((m) => m.ts === click.messageId)?.text
   if (request) result = `${request}\n\n${result}`
   else if (item && kind === 'approve' && settled) result += `\nRan \`${item.tool}\` with:\n${formatArgs(item.args, telegramEscape, (await resolveAgentTool(entry.config, item.tool))?.input_schema)}`
   await editTelegramMessage(botToken, click.conversation, click.messageId, result)
