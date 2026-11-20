@@ -274,8 +274,10 @@ import {
   getPlanJob,
   listAgentWorkflows,
   migrateAgentWorkflows,
+  moveScheduleResultsToWorkflows,
   noteForExistingAgent,
   planWorkflow,
+  postWorkflowResults,
   prepareWorkflowRun,
   startPlanJob,
   updateWorkflow,
@@ -2710,8 +2712,10 @@ async function handleSchedulesPost(req: IncomingMessage, res: ServerResponse, ag
       ...(params && Object.keys(params).length ? { params } : {}),
       schedule: (body.schedule ?? {}) as { run_at?: unknown; every?: unknown; start_at?: unknown; at?: unknown; weekday?: unknown },
       task_name: typeof body.task_name === 'string' ? body.task_name : undefined,
-      notify: (body.result_to_chat ?? body.notify) === true,
+      // A workflow's result setting is the workflow's (its Messages tab).
+      notify: !workflowId && (body.result_to_chat ?? body.notify) === true,
     })
+    if (workflowId && (body.result_to_chat ?? body.notify) === true) postWorkflowResults(agentDir(agentName), workflowId)
     scheduleJson(res, 201, task)
   } catch (err) {
     scheduleJson(res, err instanceof ScheduleError ? 400 : 500, { error: err instanceof Error ? err.message : String(err) })
@@ -5841,7 +5845,8 @@ const server = createServer(async (req, res) => {
       return
     }
     // POST /schedules/:id/result-to-chat { "result_to_chat": true|false }:
-    // whether each run's result goes to the agent's messaging app. The old
+    // whether each run's result goes to the agent's messaging app (for a
+    // workflow's schedule, true turns on the workflow's own setting). The old
     // POST /schedules/:id/notify { "notify": … } still works.
     const scheduleNotifyMatch = req.method === 'POST' && pathname.match(/^\/schedules\/([A-Za-z0-9_-]+)\/(?:result-to-chat|notify)$/)
     if (scheduleNotifyMatch) {
@@ -5849,6 +5854,14 @@ const server = createServer(async (req, res) => {
       const on = body.result_to_chat ?? body.notify
       if (typeof on !== 'boolean') return scheduleJson(res, 400, { error: 'result_to_chat must be true or false' })
       try {
+        // A workflow's schedule follows the workflow's own setting (its
+        // Messages tab): turning it on here turns that on.
+        const task = (await listScheduledTasks()).find((t) => t.task_id === scheduleNotifyMatch[1])
+        if (task?.workflow_id && getEntry(task.agent)) {
+          if (on) postWorkflowResults(agentDir(task.agent), task.workflow_id)
+          scheduleJson(res, 200, await setScheduledTaskNotify(task.task_id, false))
+          return
+        }
         scheduleJson(res, 200, await setScheduledTaskNotify(scheduleNotifyMatch[1], on))
       } catch (err) {
         scheduleJson(res, err instanceof ScheduleError ? 404 : 500, { error: err instanceof Error ? err.message : String(err) })
@@ -6165,6 +6178,10 @@ server.listen(port, () => {
   // so their schedules run them.
   const startScheduling = async () => {
     for (const name of listAgents()) await migrateAgentWorkflows(name, agentDir(name)).catch((err) => console.error(`[loopengine] moving ${name}'s workflows.yml failed:`, err))
+    // A workflow schedule's old "send result" box becomes the workflow's own.
+    await moveScheduleResultsToWorkflows((name) => (getEntry(name) ? agentDir(name) : undefined))
+      .then((moved) => { if (moved.length) console.log(`[loopengine] workflows now posting their results to chat (moved from their schedules): ${moved.join(', ')}`) })
+      .catch((err) => console.error('[loopengine] moving schedules\' result settings failed:', err))
     if (process.env.LOOPENGINE_SCHEDULER !== 'off') {
       await workflowRunner.recover()
       await scheduler.start()
