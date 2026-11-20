@@ -154,6 +154,12 @@ import {
   verifySenderSignature,
   TRUSTED_PROXY_IDENTITY_HEADER,
   verifyProxyIdentity,
+  canDecide,
+  inboxOnly,
+  inboxOnlyAllows,
+  roleLabel,
+  workspaceRole,
+  type WorkspaceRole,
   reportRun,
   usedTool,
   loopengineVersion,
@@ -278,6 +284,11 @@ import {
   type WorkflowMcpDeps,
   workflowPageHtml,
   goalsPageHtml,
+  inboxPageHtml,
+  renderInboxOnlyPage,
+  getInboxCase,
+  listInbox,
+  type InboxDeps,
   activePlaybook,
   setPlaybookProjectDir,
   startPlaybookSync,
@@ -2455,7 +2466,8 @@ async function executeUnattendedRun(agent: string, message: string, rawSessionId
       // nothing is sent to the agent's messaging app.
       ...(options.decisionsTo === 'callback'
         ? { approver: idOnlyApprover, questionHandler: idOnlyQuestions, callerDecides: true }
-        : { approver: defaultHttpWebhookNotifier ?? { requestApproval: async () => false }, questionHandler: defaultHttpWebhookNotifier ?? { requestQuestion: async () => NO_HUMAN_ANSWER } }),
+        // With no messaging app, they wait in the Inbox (web/inbox-page.ts).
+        : { approver: defaultHttpWebhookNotifier ?? idOnlyApprover, questionHandler: defaultHttpWebhookNotifier ?? idOnlyQuestions }),
     })
     if (result.pending) await createCheckpointFromPending(agent, tenant, rawSessionId, result.pending)
     return { newMessages: result.newMessages, result: { text: result.text, stopReason: result.stopReason, pendingIds: result.pending?.outstanding.map((o) => o.pendingId) } }
@@ -2465,7 +2477,7 @@ async function executeUnattendedRun(agent: string, message: string, rawSessionId
   // unattended run nobody denied anything, so say what actually happened.
   if (outcome.stopReason === 'denied') {
     const tools = /denied: (.+?)\. Send/.exec(outcome.text)?.[1] ?? 'a tool call'
-    throw new Error(`Not allowed: ${tools}. A call that needs approval is denied in an unattended run unless the Permissions tab sends approval requests somewhere (or a rule denies it outright).`)
+    throw new Error(`Not allowed: ${tools}. A permission rule denies it; change it in the Permissions tab to let it ask instead.`)
   }
   return { kind: 'done', text: outcome.text }
 }
@@ -2564,6 +2576,14 @@ function chatWarnings(agent: string, asked: { result_to_chat?: boolean; chat_not
   if (asked.chat_notice && !hasChatApp(entry.config)) warnings.push(`The chat notice won't be sent: ${agent} has no messaging app set up (Slack, Lark or Telegram).`)
   if (asked.result_to_chat && !hasNotifier(entry.config, defaultWebhook)) warnings.push(`The result won't be sent to chat: ${agent} has no messaging app set up.`)
   return warnings
+}
+
+// What the Inbox reads: every agent's runs, open decisions and histories.
+const inboxDeps: InboxDeps = {
+  runs: () => getRunStore().list(),
+  pending: async () => (await Promise.all(listAgents().map(async (agent) => (await listAgentPending(checkpoints, agent)).map((p) => ({ ...p, agent }))))).flat(),
+  history: (run) => sessions.getHistory(`default:${process.env.LOOPENGINE_ENV ?? 'production'}:${run.agent}:${run.session_id}`),
+  workflowTitle: (agent, workflowId) => (workflowId && getEntry(agent) ? readWorkflow(agentDir(agent), workflowId)?.title : undefined),
 }
 
 // Workflow runs, whatever starts them, each recorded apart from schedules.
@@ -3584,6 +3604,16 @@ function messageCaller(req: IncomingMessage): 'api' | 'console' | 'unknown' {
   return identity.role === 'api' ? 'api' : 'console'
 }
 
+// Who is making a request, and their role in the workspace
+// (core/workspace-roles.ts): from the router's signed identity when hosted
+// (a "callback" route, a program like an API key); otherwise the one admin.
+function callerOf(req: IncomingMessage): { role: WorkspaceRole; email?: string; person: boolean } {
+  const identity = trustedProxySecret ? verifyProxyIdentity(req.headers[TRUSTED_PROXY_IDENTITY_HEADER], trustedProxySecret) : undefined
+  if (!identity) return { role: 'owner', person: false }
+  if (identity.role === 'callback' || identity.role === 'api' || identity.sub.startsWith('apikey:')) return { role: 'api', person: false }
+  return { role: workspaceRole(identity.role), ...(identity.email ? { email: identity.email } : {}), person: true }
+}
+
 // For a host's run observer (core/run-events.ts).
 function reportMessageRun(req: IncomingMessage, agent: string, newMessages: Message[]): void {
   reportRun({ agent, source: 'message', id: randomUUID(), caller: messageCaller(req), usedTool: usedTool(newMessages) })
@@ -3906,9 +3936,24 @@ async function createCheckpointFromPending(
  * response here is authoritative on its own, not a fallback for some
  * other channel. */
 async function handlePendingApprovalResolve(req: IncomingMessage, res: ServerResponse, pendingId: string): Promise<void> {
-  const body = await readJsonBody(req)
+  const body = await decidingBody(req, res)
+  if (!body) return
   await settleChatFromApi(pendingId, 'approval', body)
   await resolvePendingApproval(res, pendingId, body)
+}
+
+// A decision's body, with "by" set to the signed-in person deciding (what
+// a program sends is kept); undefined, answered 403, for a viewer.
+async function decidingBody(req: IncomingMessage, res: ServerResponse): Promise<Record<string, unknown> | undefined> {
+  const caller = callerOf(req)
+  if (!canDecide(caller.role)) {
+    res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `Your role in this workspace is ${roleLabel(caller.role)}, which can't answer or approve.` }))
+    return undefined
+  }
+  const body = await readJsonBody(req)
+  if (caller.person) return { ...body, by: caller.email ?? 'a signed-in person' }
+  // A self-hosted workspace's one admin; a program says who, if it knows.
+  return caller.role === 'owner' && typeof body.by !== 'string' ? { ...body, by: 'admin' } : body
 }
 
 // A request decided over the API (an app that shows it, e.g. a run whose
@@ -4018,7 +4063,8 @@ async function resolvePendingApproval(res: ServerResponse, pendingId: string, bo
     const updated: TurnCheckpoint = { ...checkpoint, resultsSoFar, outstanding, closed: Object.keys(outstanding).length === 0 }
     return { checkpoint: updated, result: { kind: 'resolved', checkpoint: updated } }
   })
-  if (outcome.kind === 'resolved' && decided) void workflowRunner.recordDecision(decided.sessionId, { tool: decided.tool, approved: decision === 'approve' })
+  const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim().slice(0, 120) : undefined
+  if (outcome.kind === 'resolved' && decided) void workflowRunner.recordDecision(decided.sessionId, { tool: decided.tool, approved: decision === 'approve', ...(by ? { by } : {}), ...(editedArgs ? { edited: true } : {}) })
 
   if (outcome.kind === 'unknown') {
     // Unknown pendingId, or its checkpoint was already closed — a
@@ -4053,7 +4099,8 @@ async function resolvePendingApproval(res: ServerResponse, pendingId: string, bo
  * either answered or it isn't. Shares the same "outstanding empty →
  * resume, else report remaining count" tail via respondAfterResolution. */
 async function handlePendingQuestionAnswer(req: IncomingMessage, res: ServerResponse, pendingId: string): Promise<void> {
-  const body = await readJsonBody(req)
+  const body = await decidingBody(req, res)
+  if (!body) return
   await settleChatFromApi(pendingId, 'question', body)
   await answerPendingQuestion(res, pendingId, body)
 }
@@ -4067,12 +4114,15 @@ async function answerPendingQuestion(res: ServerResponse, pendingId: string, bod
 
   type ResolveOutcome = { kind: 'unknown' } | { kind: 'wrong-kind' } | { kind: 'resolved'; checkpoint: TurnCheckpoint }
 
+  // The question answered, for its workflow run's record.
+  let answered: { sessionId: string; question: string } | undefined
   const outcome = await checkpoints.withCheckpoint(pendingId, async (checkpoint): Promise<{ checkpoint: TurnCheckpoint | undefined; result: ResolveOutcome }> => {
     if (!checkpoint) return { checkpoint: undefined, result: { kind: 'unknown' } }
     const item = checkpoint.outstanding[pendingId]
     // undefined/'approval' kind hitting the question route is the mirror
     // mismatch of handlePendingApprovalResolve's own guard above.
     if (item.kind !== 'question') return { checkpoint, result: { kind: 'wrong-kind' } }
+    answered = { sessionId: checkpoint.sessionId, question: typeof item.args.question === 'string' ? item.args.question : item.reason }
 
     const resultBlock: ModelContentBlock = { type: 'tool_result', tool_use_id: item.toolUseId, content: answer, is_error: false }
     const { [pendingId]: _resolvedItem, ...remainingOutstanding } = checkpoint.outstanding
@@ -4081,6 +4131,8 @@ async function answerPendingQuestion(res: ServerResponse, pendingId: string, bod
     return { checkpoint: updated, result: { kind: 'resolved', checkpoint: updated } }
   })
 
+  const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim().slice(0, 120) : undefined
+  if (outcome.kind === 'resolved' && answered) void workflowRunner.recordAnswer(answered.sessionId, { question: answered.question, answer, ...(by ? { by } : {}) })
   if (outcome.kind === 'unknown') {
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ alreadyResolved: true }))
     return
@@ -4156,8 +4208,9 @@ async function respondAfterResolutionNow(res: ServerResponse, finalCheckpoint: T
       ...(resumedRun?.decisions_to === 'callback'
         ? { approver: idOnlyApprover, questionHandler: idOnlyQuestions, callerDecides: true }
         : {
-            approver: fromJobThread ? threadApprover : defaultHttpWebhookNotifier ?? createTrackedApprover(finalCheckpoint.sessionId),
-            questionHandler: fromJobThread ? threadQuestions : defaultHttpWebhookNotifier,
+            // A workflow run's next decision waits in the Inbox, like its first.
+            approver: fromJobThread ? threadApprover : defaultHttpWebhookNotifier ?? (resumedRun ? idOnlyApprover : createTrackedApprover(finalCheckpoint.sessionId)),
+            questionHandler: fromJobThread ? threadQuestions : defaultHttpWebhookNotifier ?? (resumedRun ? idOnlyQuestions : undefined),
           }),
       onQuestionPending: () => {},
       // A workflow run carries on unattended after the decision.
@@ -4431,8 +4484,8 @@ async function handleDecide(req: IncomingMessage, res: ServerResponse, rawToken:
       : `\`${item.tool}\` was ${decided === 'deny' ? 'denied' : body.editedArgs ? 'approved as changed' : 'approved'} on the web.`,
     ).catch((err) => console.error('[loopengine] could not update the chat request:', err))
   }
-  if (token.kind === 'question') await answerPendingQuestion(res, token.pendingId, { answer: body.answer })
-  else await resolvePendingApproval(res, token.pendingId, { decision: body.decision, editedArgs: body.editedArgs })
+  if (token.kind === 'question') await answerPendingQuestion(res, token.pendingId, { answer: body.answer, by: 'the decision link' })
+  else await resolvePendingApproval(res, token.pendingId, { decision: body.decision, editedArgs: body.editedArgs, by: 'the decision link' })
 }
 
 // The chat message of a request decided elsewhere (the web link), in
@@ -4855,8 +4908,9 @@ async function decideFromMessaging(pendingId: string, decision: MessagingDecisio
   const checkpoint = await checkpoints.get(pendingId)
   const fromJob = checkpoint ? Boolean(getEntry(checkpoint.agent) && findJobThreadBySession(agentDir(checkpoint.agent), checkpoint.sessionId)) : false
   const capture = captureResponse()
-  if (decision.kind === 'answer') await answerPendingQuestion(capture.res, pendingId, { answer: decision.answer })
-  else await resolvePendingApproval(capture.res, pendingId, { decision: decision.kind, ...(decision.kind === 'approve' && decision.editedArgs ? { editedArgs: decision.editedArgs } : {}) })
+  const by = decision.by ? { by: decision.by } : {}
+  if (decision.kind === 'answer') await answerPendingQuestion(capture.res, pendingId, { answer: decision.answer, ...by })
+  else await resolvePendingApproval(capture.res, pendingId, { decision: decision.kind, ...(decision.kind === 'approve' && decision.editedArgs ? { editedArgs: decision.editedArgs } : {}), ...by })
   const { status, body } = await capture.done
   if (status >= 400) return { error: typeof body.error === 'string' ? body.error : `HTTP ${status}` }
   if (body.alreadyResolved) return { alreadyResolved: true }
@@ -5049,6 +5103,23 @@ const server = createServer(async (req, res) => {
     if (adminAuth) headers['www-authenticate'] = 'Basic realm="loopengine"'
     res.writeHead(401, headers).end(JSON.stringify({ error: 'authorization required' }))
     return
+  }
+
+  // An approver or viewer sees the Inbox only: the front page opens it,
+  // and anything else is refused, saying where to go.
+  const caller = callerOf(req)
+  if (inboxOnly(caller.role)) {
+    const path = (req.url ?? '/').split('?')[0]
+    if (req.method === 'GET' && path === '/') {
+      res.writeHead(302, { location: '/inbox' }).end()
+      return
+    }
+    if (!inboxOnlyAllows(req.method ?? 'GET', path)) {
+      const message = `Your role in this workspace is ${roleLabel(caller.role)}, which uses the Inbox only.`
+      if (String(req.headers.accept ?? '').includes('text/html')) res.writeHead(403, { 'content-type': 'text/html; charset=utf-8' }).end(renderInboxOnlyPage(message))
+      else res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: message }))
+      return
+    }
   }
 
   // One catch-all around both routes. node:http does not catch rejections
@@ -5286,6 +5357,22 @@ const server = createServer(async (req, res) => {
       await handleGoals(req, res, pathname)
       return
     }
+    // The Inbox (web/inbox-page.ts): every run as a case, the waiting ones
+    // first; and its data.
+    if (req.method === 'GET' && pathname === '/inbox') {
+      res.writeHead(200, { 'content-type': 'text/html' }).end(inboxPageHtml)
+      return
+    }
+    if (req.method === 'GET' && (pathname === '/inbox/items' || pathname === '/inbox/count' || pathname.startsWith('/inbox/cases/'))) {
+      const json = (status: number, body: unknown) => res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+      if (pathname.startsWith('/inbox/cases/')) {
+        const found = await getInboxCase(inboxDeps, decodeURIComponent(pathname.slice('/inbox/cases/'.length)))
+        return found ? json(200, found) : json(404, { error: 'No such case: it may have been removed.' })
+      }
+      const q = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const listed = await listInbox(inboxDeps, { open: q.get('open') === '1', q: q.get('q') ?? undefined, workflow: q.get('workflow') ?? undefined })
+      return pathname === '/inbox/count' ? json(200, { open: listed.open }) : json(200, listed)
+    }
     // The Jobs page (the same page as Goals, on its jobs view), and its API.
     if (req.method === 'GET' && pathname === '/jobs' && String(req.headers.accept ?? '').includes('text/html')) {
       res.writeHead(200, { 'content-type': 'text/html' }).end(goalsPageHtml)
@@ -5398,9 +5485,10 @@ const server = createServer(async (req, res) => {
         ? {
             mode: 'hosted',
             email: identity.email ?? null,
+            role: callerOf(req).role,
             dashboardUrl: identity.dashboardUrl && /^https?:\/\//.test(identity.dashboardUrl) ? identity.dashboardUrl : null,
           }
-        : { mode: adminAuth ? 'basic' : 'open' }
+        : { mode: adminAuth ? 'basic' : 'open', role: 'owner' }
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(
         JSON.stringify({
           signIn,
