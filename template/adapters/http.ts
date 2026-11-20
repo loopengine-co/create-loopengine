@@ -291,6 +291,8 @@ import {
   goalsPageHtml,
   inboxPageHtml,
   renderInboxOnlyPage,
+  workflowsOverviewPageHtml,
+  workflowsOverview,
   getInboxCase,
   listInbox,
   type InboxDeps,
@@ -5203,10 +5205,19 @@ const server = createServer(async (req, res) => {
     // web/playground.ts. GET, not POST, and an exact path match
     // (neither has a :name segment), so no risk of colliding with the
     // regexes above (already partitioned by method).
-    // The bare address opens a new goal (the Goals page; all its links and
-    // requests use absolute paths). Agents are at /agents/config.
-    if (req.method === 'GET' && pathname === '/') {
-      res.writeHead(200, { 'content-type': 'text/html' }).end(goalsPageHtml)
+    // The bare address opens the Workflows overview, as does /workflows
+    // from a browser (the planner's data stays at /workflows for scripts).
+    // Goals are at /goals; agents at /agents/config.
+    if (req.method === 'GET' && (pathname === '/' || (pathname === '/workflows' && String(req.headers.accept ?? '').includes('text/html')))) {
+      res.writeHead(200, { 'content-type': 'text/html' }).end(workflowsOverviewPageHtml)
+      return
+    }
+    if (req.method === 'GET' && pathname === '/workflows/overview') {
+      const agents = listAgents().filter((name) => getEntry(name))
+      const workflows = (await Promise.all(agents.map(async (agent) => (await listAgentWorkflows(agent, agentDir(agent)).catch(() => [])).map((view) => ({ agent, agentLabel: getEntry(agent)?.config.displayName ?? agent, view }))))).flat()
+      const deps = inboxDepsFor(req)
+      const { items } = await listInbox(deps, { open: true, limit: 1000 })
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(workflowsOverview({ workflows, runs: await getRunStore().list(), waiting: items })))
       return
     }
 
