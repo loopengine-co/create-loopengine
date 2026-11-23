@@ -288,7 +288,7 @@ import {
   type WorkflowAppStatus,
   type WorkflowMcpDeps,
   workflowPageHtml,
-  goalsPageHtml,
+  goalsPageAs,
   inboxPageHtml,
   renderInboxOnlyPage,
   workflowsOverviewPageHtml,
@@ -5419,7 +5419,11 @@ const server = createServer(async (req, res) => {
     // "Find your first agent": the page, and its routes.
     // The Goals page (a browser asking for a page), and its API.
     if (req.method === 'GET' && pathname === '/goals' && String(req.headers.accept ?? '').includes('text/html')) {
-      res.writeHead(200, { 'content-type': 'text/html' }).end(goalsPageHtml)
+      // The header as the page will show it: one goal, a new goal (asked
+      // for, or no goals yet), or the list.
+      const q = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const view = q.get('goal') ? 'goal' : q.has('new') || !listGoals(goalsDeps).some((g) => !g.standalone) ? 'new' : 'goals'
+      res.writeHead(200, { 'content-type': 'text/html' }).end(goalsPageAs(view))
       return
     }
     if (pathname === '/goals' || pathname.startsWith('/goals/')) {
@@ -5447,7 +5451,10 @@ const server = createServer(async (req, res) => {
     }
     // The Jobs page (the same page as Goals, on its jobs view), and its API.
     if (req.method === 'GET' && pathname === '/jobs' && String(req.headers.accept ?? '').includes('text/html')) {
-      res.writeHead(200, { 'content-type': 'text/html' }).end(goalsPageHtml)
+      // The list, or the new-job form (asked for, or no jobs yet).
+      const q = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const view = q.has('new') || !(await listJobs(goalsDeps)).length ? 'new-job' : q.get('job') ? 'job' : 'jobs'
+      res.writeHead(200, { 'content-type': 'text/html' }).end(goalsPageAs(view))
       return
     }
     if (pathname === '/jobs') {
