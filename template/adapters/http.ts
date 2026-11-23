@@ -292,6 +292,8 @@ import {
   inboxPageHtml,
   renderInboxOnlyPage,
   workflowsOverviewPageHtml,
+  homePageHtml,
+  homeOverview,
   workflowsOverview,
   getInboxCase,
   listInbox,
@@ -304,6 +306,7 @@ import {
   addJob,
   assignJob,
   chainedRuns,
+  jobsByWorkflow,
   editJob,
   goalView,
   listJob,
@@ -2021,9 +2024,15 @@ async function workflowsView(agentName: string): Promise<Record<string, unknown>
     messaging = n.source === 'none' ? null : (n.primary ?? n.channel ?? null)
   } catch {}
   const escape = (n: string) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // The jobs each workflow does (a goal's or the person's own).
+  let jobsOf = new Map<string, { id: string; title: string }[]>()
+  try {
+    jobsOf = jobsByWorkflow(goalsDeps)
+  } catch {}
   return {
     workflows: workflows.map((w) => ({
       ...w,
+      ...(jobsOf.get(`${agentName}|${w.id}`)?.length ? { jobs: jobsOf.get(`${agentName}|${w.id}`) } : {}),
       tools: names
         .filter((n) => new RegExp(`(^|[^A-Za-z0-9_])${escape(n)}($|[^A-Za-z0-9_])`).test(w.instructions))
         .map((n) => ({ name: n, decision: rules.resolve(n, {}, scope)[0] })),
@@ -5228,19 +5237,26 @@ const server = createServer(async (req, res) => {
     // web/playground.ts. GET, not POST, and an exact path match
     // (neither has a :name segment), so no risk of colliding with the
     // regexes above (already partitioned by method).
-    // The bare address opens the Workflows overview, as does /workflows
-    // from a browser (the planner's data stays at /workflows for scripts).
+    // The bare address opens the home page: goals, their jobs and the
+    // workflows that do them. /workflows from a browser lists every
+    // workflow (the planner's data stays at /workflows for scripts).
     // Goals are at /goals; agents at /agents/config.
-    if (req.method === 'GET' && (pathname === '/' || (pathname === '/workflows' && String(req.headers.accept ?? '').includes('text/html')))) {
+    if (req.method === 'GET' && pathname === '/') {
+      res.writeHead(200, { 'content-type': 'text/html' }).end(homePageHtml)
+      return
+    }
+    if (req.method === 'GET' && pathname === '/workflows' && String(req.headers.accept ?? '').includes('text/html')) {
       res.writeHead(200, { 'content-type': 'text/html' }).end(workflowsOverviewPageHtml)
       return
     }
-    if (req.method === 'GET' && pathname === '/workflows/overview') {
+    if (req.method === 'GET' && (pathname === '/workflows/overview' || pathname === '/home/overview')) {
       const agents = listAgents().filter((name) => getEntry(name))
       const workflows = (await Promise.all(agents.map(async (agent) => (await listAgentWorkflows(agent, agentDir(agent)).catch(() => [])).map((view) => ({ agent, agentLabel: getEntry(agent)?.config.displayName ?? agent, view }))))).flat()
       const deps = inboxDepsFor(req)
       const { items } = await listInbox(deps, { open: true, limit: 1000 })
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(workflowsOverview({ workflows, runs: await getRunStore().list(), waiting: items })))
+      const overview = workflowsOverview({ workflows, runs: await getRunStore().list(), waiting: items })
+      const body = pathname === '/home/overview' ? homeOverview(overview, listGoals(goalsDeps)) : overview
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
       return
     }
 
