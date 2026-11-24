@@ -118,9 +118,13 @@ import {
   workflowRunMessage,
   writeWorkspacePolicies,
   type Workflow,
+  fetchAnchors,
+  startAuditAnchoring,
   briefContent,
   briefFromContent,
   eventPeople,
+  lastAnchor,
+  verifyEventChain,
   getVersion,
   listEvents,
   listVersions,
@@ -133,7 +137,7 @@ import {
   type EventFilter,
   caseRow,
   eventsCsv,
-  auditPageHtml,
+  auditPageFor,
   changeOf,
   keptBody,
   sessionUsage,
@@ -141,6 +145,9 @@ import {
   type UsageRow,
   workflowHealth,
   type WorkflowHealth,
+  buildWorkflowAudit,
+  type WorkflowAudit,
+  workflowAuditReportHtml,
   compressResponses,
   serveConsoleAsset,
   EvidenceError,
@@ -2709,13 +2716,38 @@ const inboxDeps: InboxDeps = {
 async function healthOf(agent: string, workflowId: string, days = 30): Promise<WorkflowHealth> {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
   const runs = await runsSince(agent, workflowId, since)
+  return workflowHealth(runs, runCosts(agent, runs), { days })
+}
+
+// Each run's cost in US dollars, where every model call has a price.
+function runCosts(agent: string, runs: WorkflowRun[]): Map<string, number> {
   const calls = usageBySession(agent, runs.map((r) => r.session_id))
   const costs = new Map<string, number>()
   for (const run of runs) {
     const rows = pricedUsage(calls.get(run.session_id) ?? [])
     if (rows.length && rows.every((u) => u.costUsd != null)) costs.set(run.run_id, rows.reduce((n, u) => n + u.costUsd!, 0))
   }
-  return workflowHealth(runs, costs, { days })
+  return costs
+}
+
+// A workflow's audit for a period (web/workflow-audit.ts): its runs,
+// decisions, brief versions, settings changes and cost, and the log's
+// check against its anchors.
+async function workflowAuditOf(agent: string, workflowId: string, since: string, until: string): Promise<WorkflowAudit | undefined> {
+  const workflow = readWorkflow(agentDir(agent), workflowId)
+  if (!workflow) return undefined
+  const runs = (await runsSince(agent, workflowId, since)).filter((r) => r.started_at <= until)
+  const remote = await fetchAnchors()
+  return buildWorkflowAudit({
+    workflow: { agent, agentLabel: getEntry(agent)?.config.displayName ?? agent, id: workflowId, title: workflow.title },
+    since,
+    until,
+    runs,
+    costs: runCosts(agent, runs),
+    versions: listVersions({ agent, workflowId, kind: 'brief' }),
+    changes: listEvents({ agent, workflowId, kind: 'change', since, until, limit: 500 }),
+    verification: { ...verifyEventChain('anchors' in remote ? remote.anchors : undefined), anchoredAt: 'anchors' in remote ? 'loopengine.co' : 'this workspace' },
+  })
 }
 
 // Hourly: a workflow whose health just got worse (a health alert) says
@@ -2780,6 +2812,16 @@ function noteBrief(agent: string, workflowId: string, about: { by?: string; reas
 }
 function notePolicies(about: { by?: string; reason?: string } = {}): number | undefined {
   return noteVersion({ agent: '', workflowId: '', kind: 'policies' }, readWorkspacePolicies(process.cwd()), about)
+}
+
+// What the Audit page's filters offer: agents, workflows, people.
+function auditFilters(): { agents: { name: string; label: string }[]; workflows: { agent: string; id: string; title: string }[]; people: string[] } {
+  const agents = listAgents().filter((name) => getEntry(name))
+  return {
+    agents: agents.map((name) => ({ name, label: getEntry(name)?.config.displayName ?? name })),
+    workflows: agents.flatMap((agent) => readWorkflows(agentDir(agent)).map((w) => ({ agent, id: w.id, title: w.title }))),
+    people: eventPeople(),
+  }
 }
 
 // The Audit log's filters, from a request's query (?agent, workflow,
@@ -5759,6 +5801,39 @@ const server = createServer(async (req, res) => {
       await handleWorkflowTriggers(req, res, decodeURIComponent(triggersMatch[1]), triggersMatch[2], triggersMatch[3], triggersMatch[4])
       return
     }
+    // A workflow's audit for a period (?since, ?until; the last 30 days
+    // by default): as JSON, or …/report to read and print, or
+    // …/report?format=json to download.
+    const workflowAuditMatch = req.method === 'GET' && pathname.match(/^\/agents\/([^/]+)\/workflows\/([a-z0-9-]+)\/audit(\/report)?$/)
+    if (workflowAuditMatch) {
+      const agentName = decodeURIComponent(workflowAuditMatch[1])
+      const q = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const iso = (v: string | null) => (v && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : undefined)
+      const until = iso(q.get('until')) ?? new Date().toISOString()
+      const since = iso(q.get('since')) ?? new Date(Date.parse(until) - 30 * 24 * 60 * 60 * 1000).toISOString()
+      const audit = getEntry(agentName) ? await workflowAuditOf(agentName, workflowAuditMatch[2], since, until) : undefined
+      if (!audit) {
+        res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: `No workflow ${workflowAuditMatch[2]} on ${agentName}.` }))
+        return
+      }
+      const report = workflowAuditMatch[3] === '/report'
+      if (!report || q.get('format') === 'json') {
+        const generated = { generatedAt: new Date().toISOString(), generatedBy: changedBy(req), ...audit }
+        const name = `audit-${audit.workflow.id}-${since.slice(0, 10)}-to-${until.slice(0, 10)}.json`
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store', ...(report ? { 'content-disposition': `attachment; filename="${name}"` } : {}) }).end(JSON.stringify(report ? generated : audit, null, report ? 2 : 0))
+        return
+      }
+      const period = `since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`
+      const html = workflowAuditReportHtml(audit, {
+        generatedAt: new Date().toISOString(),
+        by: changedBy(req),
+        jsonHref: `${pathname}?${period}&format=json`,
+        caseHref: (runId) => `/inbox?case=${encodeURIComponent(runId)}`,
+        pageHref: `/audit?agent=${encodeURIComponent(agentName)}&workflow=${encodeURIComponent(audit.workflow.id)}`,
+      })
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(html)
+      return
+    }
     const agentWorkflowsMatch = pathname.match(/^\/agents\/([^/]+)\/workflows(?:\/([a-z0-9-]+))?(?:\/(run|runs|preview|messages|versions|health))?(?:\/([1-9][0-9]*)\/restore)?$/)
     if (agentWorkflowsMatch && (!agentWorkflowsMatch[4] || agentWorkflowsMatch[3] === 'versions')) {
       await handleAgentWorkflows(req, res, decodeURIComponent(agentWorkflowsMatch[1]), agentWorkflowsMatch[2], agentWorkflowsMatch[3], agentWorkflowsMatch[4] ? Number(agentWorkflowsMatch[4]) : undefined)
@@ -5889,12 +5964,25 @@ const server = createServer(async (req, res) => {
     // else the log itself: changes, decisions, answers and feedback,
     // newest first, filtered (core/audit-store.ts's listEvents).
     if (req.method === 'GET' && pathname === '/audit' && String(req.headers.accept ?? '').includes('text/html')) {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(auditPageHtml)
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(auditPageFor(auditFilters()))
       return
     }
     if (req.method === 'GET' && (pathname === '/audit' || pathname === '/audit/events')) {
       const events = listEvents(eventFilterOf(req))
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ events, next: events.length ? events.at(-1)!.id : null }))
+      return
+    }
+    // Checks the log's hash chain, and every anchor sent away (fetched
+    // back from loopengine.co; off Cloud, the ones kept here).
+    if (req.method === 'GET' && pathname === '/audit/verify') {
+      const remote = await fetchAnchors()
+      const check = verifyEventChain('anchors' in remote ? remote.anchors : undefined)
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({
+        ...check,
+        anchoredAt: 'anchors' in remote ? 'loopengine.co' : 'this workspace',
+        ...('unavailable' in remote ? { anchorsNote: remote.unavailable } : {}),
+        lastAnchor: lastAnchor() ?? null,
+      }))
       return
     }
     // The same log as a CSV file, up to 10,000 rows.
@@ -5933,13 +6021,7 @@ const server = createServer(async (req, res) => {
     }
     // What the Audit page's filters offer: agents, workflows, people.
     if (req.method === 'GET' && pathname === '/audit/filters') {
-      const agents = listAgents().filter((name) => getEntry(name))
-      const workflows = agents.flatMap((agent) => readWorkflows(agentDir(agent)).map((w) => ({ agent, id: w.id, title: w.title })))
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({
-        agents: agents.map((name) => ({ name, label: getEntry(name)?.config.displayName ?? name })),
-        workflows,
-        people: eventPeople(),
-      }))
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(auditFilters()))
       return
     }
     // Shared policies' versions, newest first, and restoring one.
@@ -6508,6 +6590,7 @@ server.listen(port, () => {
   setInterval(checkGoals, 24 * 60 * 60 * 1000).unref()
   const checkHealth = () => void sendHealthAlerts().catch((err) => console.error('[loopengine] checking workflow health failed:', err))
   setInterval(checkHealth, 60 * 60 * 1000).unref()
+  startAuditAnchoring((m) => console.log(m))
   startLeverEventsSync(projectDir(), (m) => console.log(m))
   reportAgentNames()
   // LOOPENGINE_SCHEDULER=off leaves scheduling to another process.
