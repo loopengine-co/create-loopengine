@@ -147,10 +147,11 @@ export interface UpgradeOptions {
    * (a real `npm pack`). Test-only seam to avoid hitting the real
    * registry for a fixture "old" template. */
   resolveBaseTemplateDir?: (version: string) => string
-  /** Resolves a package's current latest version — defaults to a real
-   * `npm view <pkg> version`. Test-only seam to avoid hitting the real
-   * registry. */
-  resolveLatestVersion?: (pkg: string) => string
+  /** Resolves a package's newest version, within `range` when given (the
+   * range this CLI's own template declares) — defaults to a real
+   * `npm view <pkg>@<range> version`. Test-only seam to avoid hitting the
+   * real registry. */
+  resolveLatestVersion?: (pkg: string, range?: string) => string
   /** Runs `npm install` in projectDir — defaults to a real one. Test-only
    * seam to avoid actually installing anything during tests. */
   runNpmInstall?: (projectDir: string) => void
@@ -283,7 +284,7 @@ export function upgradeProject(options: UpgradeOptions = {}): UpgradeResult {
   const files = UPGRADE_CANDIDATE_FILES.map((candidate) => upgradeFile(candidate, baseTemplateDir, currentTemplateDir, projectDir, options.keepEdited))
 
   const resolveLatestVersion = options.resolveLatestVersion ?? resolveLatestVersionFromNpm
-  const dependencies = bumpDependencies(projectDir, resolveLatestVersion)
+  const dependencies = bumpDependencies(projectDir, resolveLatestVersion, templateRanges(currentTemplateDir))
 
   let npmInstall: UpgradeResult['npmInstall']
   if (dependencies.length > 0) {
@@ -306,8 +307,26 @@ export function upgradeProject(options: UpgradeOptions = {}): UpgradeResult {
   return { fromVersion, toVersion, files, dependencies, npmInstall }
 }
 
-function resolveLatestVersionFromNpm(pkg: string): string {
-  return execFileSync('npm', ['view', pkg, 'version'], { stdio: 'pipe' }).toString().trim()
+function resolveLatestVersionFromNpm(pkg: string, range?: string): string {
+  // With a range, npm lists every matching version (one as a string, more
+  // as an array, oldest first): the newest is the last.
+  const out = execFileSync('npm', ['view', range ? `${pkg}@${range}` : pkg, 'version', '--json'], { stdio: 'pipe' }).toString().trim()
+  const parsed = JSON.parse(out) as string | string[]
+  const version = Array.isArray(parsed) ? parsed[parsed.length - 1] : parsed
+  if (!version) throw new Error(`npm has no ${pkg} version${range ? ` matching ${range}` : ''}`)
+  return version
+}
+
+/** The dependency ranges this CLI's own template declares: the versions
+ * its adapters/http.ts was made for. */
+function templateRanges(templateDir: string): Record<string, string> {
+  const path = join(templateDir, 'package.json')
+  if (!existsSync(path)) return {}
+  try {
+    return (JSON.parse(readFileSync(path, 'utf8')) as { dependencies?: Record<string, string> }).dependencies ?? {}
+  } catch {
+    return {}
+  }
 }
 
 function runRealNpmInstall(projectDir: string): void {
@@ -327,7 +346,8 @@ function runRealNpmInstall(projectDir: string): void {
 const UPGRADABLE_DEPENDENCIES = ['loopengine', 'actauth', 'skillgarden'] as const
 
 /** Bumps package.json's dependency ranges for whichever of
- * loopengine/actauth/skillgarden are already present, to `^<latest>` —
+ * loopengine/actauth/skillgarden are already present, to `^<latest>`
+ * (the newest within the range the template declares) —
  * run automatically as part of `upgrade` (not left as a manual follow-up
  * step) because a project whose merged template code now calls a newer
  * export, but whose installed package is still old, fails silently: no
@@ -337,7 +357,7 @@ const UPGRADABLE_DEPENDENCIES = ['loopengine', 'actauth', 'skillgarden'] as cons
  * [] untouched if the project has no package.json at all, same
  * "can't merge what isn't there" reasoning upgradeFile's own missing-file
  * check uses. */
-function bumpDependencies(projectDir: string, resolveLatestVersion: (pkg: string) => string): UpgradeDependencyResult[] {
+function bumpDependencies(projectDir: string, resolveLatestVersion: (pkg: string, range?: string) => string, ranges: Record<string, string> = {}): UpgradeDependencyResult[] {
   const pkgPath = join(projectDir, 'package.json')
   if (!existsSync(pkgPath)) return []
 
@@ -349,7 +369,12 @@ function bumpDependencies(projectDir: string, resolveLatestVersion: (pkg: string
   for (const name of UPGRADABLE_DEPENDENCIES) {
     const currentRange = deps[name]
     if (currentRange === undefined) continue
-    const latest = resolveLatestVersion(name)
+    // The newest version within the template's own range, never past it:
+    // a loopengine newer than the template was made for may have dropped
+    // something its adapters/http.ts imports, and the server wouldn't start.
+    // A release that drops such a name bumps the minor (0.5.0), outside a
+    // ^0.4.x range, and comes with a template whose range takes it.
+    const latest = resolveLatestVersion(name, ranges[name])
     const newRange = `^${latest}`
     if (currentRange === newRange) continue
     deps[name] = newRange

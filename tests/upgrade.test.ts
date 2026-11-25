@@ -204,6 +204,27 @@ describe('upgradeProject dependency bumps', () => {
     expect(pkg.dependencies).toEqual({ loopengine: '^0.1.7', actauth: '^0.0.13', 'some-other-package': '^1.0.0' })
   })
 
+  it('bumps to the newest version within the range the template declares, never past it', () => {
+    const baseTemplateDir = makeTemplateDir('line3')
+    const currentTemplateDir = makeTemplateDir('line3')
+    writeFileSync(join(currentTemplateDir, 'package.json'), JSON.stringify({ dependencies: { loopengine: '^0.4.13' } }))
+    const projectDir = makeProjectDir('1.0.0', 'line1\nline2\nline3\nline4\nline5\n')
+    writeFileSync(join(projectDir, 'package.json'), JSON.stringify({ dependencies: { loopengine: '^0.4.12' } }))
+    const asked: [string, string | undefined][] = []
+
+    const result = upgradeProject({
+      projectDir,
+      currentTemplateDir,
+      resolveBaseTemplateDir: () => baseTemplateDir,
+      // npm has 0.5.0 too, but ^0.4.13 stops at 0.4.14.
+      resolveLatestVersion: (pkg, range) => (asked.push([pkg, range]), range === '^0.4.13' ? '0.4.14' : '0.5.0'),
+      runNpmInstall: () => {},
+    })
+
+    expect(asked).toEqual([['loopengine', '^0.4.13']])
+    expect(result.dependencies).toEqual([{ name: 'loopengine', from: '^0.4.12', to: '^0.4.14' }])
+  })
+
   it('never adds a dependency the project did not already have', () => {
     const baseTemplateDir = makeTemplateDir('line3')
     const currentTemplateDir = makeTemplateDir('line3')
