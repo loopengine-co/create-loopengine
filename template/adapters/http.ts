@@ -120,6 +120,7 @@ import {
   workflowRunMessage,
   writeWorkspacePolicies,
   type Workflow,
+  type WorkflowFields,
   listTraceSpans,
   workflowContent,
   workflowFromContent,
@@ -138,7 +139,9 @@ import {
   type AuditEventKind,
   type EventFilter,
   caseRow,
+  eventAction,
   eventsCsv,
+  type EventNames,
   auditPageFor,
   changeOf,
   describeChanges,
@@ -348,9 +351,13 @@ import {
   homePageHtml,
   homeOverview,
   workflowsOverview,
+  INBOX_VIEWS,
   getInboxCase,
   listInbox,
   type InboxDeps,
+  type InboxView,
+  readArchived,
+  setArchived,
   buildRunTrace,
   type RunTrace,
   changeDraft,
@@ -1991,6 +1998,11 @@ async function handleWorkflows(req: IncomingMessage, res: ServerResponse, pathna
           return entry ? describeAgentNotifier(entry.config, defaultWebhook).source !== 'none' : false
         },
       })
+      // In the log as who created which workflow, and numbered as its
+      // first version, credited to them.
+      const by = changedBy(req)
+      await noteWorkflowVersion(created.agent, created.workflowId, { by, reason: 'Created' }).catch(() => undefined)
+      recordEvent({ agent: created.agent, workflow_id: created.workflowId, kind: 'change', by, data: { label: 'Created a workflow', method: 'POST', path: '/workflows/create', title: created.workflow } })
       // The planned webhook's URL, shown once on the done screen.
       if (created.webhook) {
         const { token, ...webhook } = created.webhook
@@ -2294,13 +2306,16 @@ async function handleAgentWorkflows(req: IncomingMessage, res: ServerResponse, a
       const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : ''
       const previous = await noteWorkflowVersion(agentName, id)
       await publishDraft(agentName, workflow, draft)
-      const version = await noteWorkflowVersion(agentName, id, { by: changedBy(req), reason: note || 'Published' })
+      const version = await noteWorkflowVersion(agentName, id, { by: changedBy(req), reason: note || (draft.restoredFrom ? `Restored version ${draft.restoredFrom}` : 'Published') })
       return json(200, { version: version ?? null, previous: previous ?? null, changes })
     }
-    // The workflow's versions, newest first, and restoring one (which
-    // saves it as a new version): its name, inputs, model, instructions and
-    // result format. A version from when only the brief was numbered
-    // restores just the instructions and result format.
+    // The workflow's versions, newest first, and restoring one: its
+    // inputs, model, instructions, result format, output schema and
+    // success criteria become the workflow's draft (replacing any draft of
+    // those), to review and publish as the next version. Its name and
+    // description aren't drafted, so they stay as they are. A version from
+    // when only the brief was numbered restores just the instructions and
+    // result format.
     if (id && action === 'versions' && req.method === 'GET') {
       if (!readWorkflow(dir, id)) return json(404, { error: `No workflow ${id}.` })
       const current = await noteWorkflowVersion(agentName, id)
@@ -2311,24 +2326,30 @@ async function handleAgentWorkflows(req: IncomingMessage, res: ServerResponse, a
       if (!workflow) return json(404, { error: `No workflow ${id}.` })
       const version = getVersion({ agent: agentName, workflowId: id, kind: 'workflow' }, restoreNumber)
       if (!version) return json(404, { error: `No version ${restoreNumber} of ${id}.` })
-      await noteWorkflowVersion(agentName, id)
+      const basedOn = await noteWorkflowVersion(agentName, id)
       const saved = workflowFromContent(version.content)
-      setWorkflowFields(dir, id, {
-        title: saved.title || workflow.title,
-        description: saved.description ?? workflow.description,
+      const fields: WorkflowFields = {
         instructions: saved.instructions,
-        parameters: saved.parameters ?? workflow.parameters,
+        parameters: (saved.parameters as Workflow['parameters'] | undefined) ?? workflow.parameters,
         output: saved.output ?? null,
         ...(saved.title !== undefined ? { model: saved.model ?? null } : {}),
         // A version from before output schemas were recorded leaves it be.
         ...(saved.criteria !== undefined ? { outputSchema: saved.outputSchema ?? null } : {}),
-      })
-      // Its success criteria come back too; its tools' permissions (the
-      // agent's, shared by its other workflows) and its triggers (live
-      // webhooks and schedules) stay as they are.
-      if (saved.criteria) setEvalCriteria(dir, id, saved.criteria)
-      const current = await noteWorkflowVersion(agentName, id, { by: changedBy(req), reason: `Restored version ${restoreNumber}` })
-      return json(200, { current: current ?? null, versions: listVersions({ agent: agentName, workflowId: id, kind: 'workflow' }).map(workflowVersionView) })
+      }
+      const same = (a: { text: string; kind: string; value?: string }[], b: { text: string; kind: string; value?: string }[]) =>
+        JSON.stringify(a.map((c) => [c.text, c.kind, c.value ?? ''])) === JSON.stringify(b.map((c) => [c.text, c.kind, c.value ?? '']))
+      const fieldsSame = !draftChanges({ workflow, criteria: [], delivery: undefined, triggers: [] }, { workflow: withDraft(workflow, fields), criteria: [], delivery: undefined, triggers: [] }).length
+      const criteriaSame = !saved.criteria || same(saved.criteria, readEvals(dir, id).criteria)
+      // Its tools' permissions (the agent's, shared by its other
+      // workflows) and its triggers (live webhooks and schedules) stay as
+      // they are.
+      changeDraft(projectDir(), agentName, id, { by: changedBy(req), ...(basedOn ? { basedOn } : {}) }, ({ fields: _f, criteria: _c, restoredFrom: _r, ...d }) => ({
+        ...d,
+        ...(fieldsSame ? {} : { fields }),
+        ...(criteriaSame ? {} : { criteria: saved.criteria }),
+        ...(fieldsSame && criteriaSame ? {} : { restoredFrom: restoreNumber }),
+      }))
+      return json(200, await draftView(agentName, readWorkflow(dir, id)!))
     }
     if (id && !action && req.method === 'DELETE') {
       const { cancelled } = await forgetWorkflow(agentName, dir, id)
@@ -2767,6 +2788,8 @@ const inboxDeps: InboxDeps = {
   workflowTitle: (agent, workflowId) => (workflowId && getEntry(agent) ? readWorkflow(agentDir(agent), workflowId)?.title : undefined),
   run: (runId) => (/^[A-Za-z0-9_-]+$/.test(runId) ? getRunStore().get(runId) : Promise.resolve(undefined)),
   usage: (run) => pricedUsage(sessionUsage(run.agent, run.session_id)),
+  agentLabel: (agent) => getEntry(agent)?.config.displayName ?? agent,
+  archived: () => readArchived(projectDir()),
 }
 
 // A workflow's health over the last `days` days (web/workflow-health.ts):
@@ -3147,6 +3170,14 @@ function notePolicies(about: { by?: string; reason?: string } = {}): number | un
 }
 
 // What the Audit page's filters offer: agents, workflows, people.
+// Agents and workflows by their names now, for the log's resources.
+function auditNames(): EventNames {
+  return {
+    agentLabel: (agent) => getEntry(agent)?.config.displayName ?? agent,
+    workflowTitle: (agent, workflowId) => (getEntry(agent) ? readWorkflow(agentDir(agent), workflowId)?.title : undefined),
+  }
+}
+
 function auditFilters(): { agents: { name: string; label: string }[]; workflows: { agent: string; id: string; title: string }[]; people: string[] } {
   const agents = listAgents().filter((name) => getEntry(name))
   return {
@@ -6072,25 +6103,26 @@ const server = createServer(async (req, res) => {
       await handleGoals(req, res, pathname)
       return
     }
-    // The Inbox (web/inbox-page.ts): every run as a case, the waiting ones
-    // first; and its data.
-    // A case's own address; links from before it opened /inbox?case=<id>.
+    // The Inbox (web/inbox-page.ts): every run as a conversation, and its
+    // data. An approver or viewer gets it Inbox-only from the start, so the
+    // rest of the sidebar never shows.
     if (req.method === 'GET' && pathname === '/inbox') {
-      const asked = new URL(req.url ?? '/', 'http://localhost').searchParams.get('case')
-      if (asked) {
-        res.writeHead(302, { location: `/cases/${encodeURIComponent(asked)}` }).end()
-        return
-      }
-    }
-    const casePage = req.method === 'GET' && /^\/cases\/[^/]+$/.test(pathname)
-    if (req.method === 'GET' && (pathname === '/inbox' || casePage)) {
-      // An approver or viewer gets it Inbox-only from the start, so the
-      // rest of the sidebar never shows. A case is the same page, opening
-      // on that case.
-      let page = inboxOnly(callerOf(req).role) ? inboxPageHtml.replace('<div class="le-app">', '<div class="le-app le-inbox-only">') : inboxPageHtml
-      if (casePage) page = page.replace('<body data-le-page="inbox">', '<body data-le-page="case">')
+      const page = inboxOnly(callerOf(req).role) ? inboxPageHtml.replace('<div class="le-app">', '<div class="le-app le-inbox-only">') : inboxPageHtml
       res.writeHead(200, { 'content-type': 'text/html' }).end(page)
       return
+    }
+    // Archiving a case, or bringing it back (POST or DELETE
+    // /inbox/cases/:id/archive): anyone who can decide in the Inbox.
+    const archiveMatch = (req.method === 'POST' || req.method === 'DELETE') && pathname.match(/^\/inbox\/cases\/([^/]+)\/archive$/)
+    if (archiveMatch) {
+      const json = (status: number, body: unknown) => res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
+      if (!canDecide(callerOf(req).role)) return void json(403, { error: 'Your role can see the Inbox but not change it.' })
+      const id = decodeURIComponent(archiveMatch[1])
+      const found = await getInboxCase(inboxDepsFor(req), id)
+      if (!found) return void json(404, { error: 'No such case: it may have been removed.' })
+      if (req.method === 'POST' && found.pending.length) return void json(400, { error: 'It waits on a person: decide first, then archive it.' })
+      setArchived(projectDir(), [id], req.method === 'POST', changedBy(req))
+      return void json(200, { archived: req.method === 'POST' })
     }
     if (req.method === 'GET' && (pathname === '/inbox/items' || pathname === '/inbox/count' || pathname.startsWith('/inbox/cases/'))) {
       const json = (status: number, body: unknown) => res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body))
@@ -6134,8 +6166,8 @@ const server = createServer(async (req, res) => {
         return found ? json(200, found) : json(404, { error: 'No such case: it may have been removed.' })
       }
       const q = new URL(req.url ?? '/', 'http://localhost').searchParams
-      const view = q.get('view')
-      const listed = await listInbox(inboxDepsFor(req), { open: q.get('open') === '1', view: view === 'needs' || view === 'recent' ? view : 'auto', q: q.get('q') ?? undefined, workflow: q.get('workflow') ?? undefined })
+      const view = q.get('view') as InboxView | null
+      const listed = await listInbox(inboxDepsFor(req), { open: q.get('open') === '1', view: view && INBOX_VIEWS.includes(view) ? view : 'auto', q: q.get('q') ?? undefined, workflow: q.get('workflow') ?? undefined })
       return pathname === '/inbox/count' ? json(200, { open: listed.open }) : json(200, listed)
     }
     // Jobs are gone: a goal holds workflows and groups. Old links go to Goals.
@@ -6265,7 +6297,7 @@ const server = createServer(async (req, res) => {
         generatedAt: new Date().toISOString(),
         by: changedBy(req),
         jsonHref: `${pathname}?${period}&format=json`,
-        caseHref: (runId) => `/cases/${encodeURIComponent(runId)}`,
+        traceHref: (runId) => `/agents/config?agent=${encodeURIComponent(agentName)}&tab=workflows&workflow=${encodeURIComponent(audit.workflow.id)}&wtab=activity&run=${encodeURIComponent(runId)}`,
         pageHref: `/audit?agent=${encodeURIComponent(agentName)}&workflow=${encodeURIComponent(audit.workflow.id)}`,
       })
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(html)
@@ -6412,7 +6444,8 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'GET' && (pathname === '/audit' || pathname === '/audit/events')) {
       const events = listEvents(eventFilterOf(req))
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ events, next: events.length ? events.at(-1)!.id : null }))
+      const names = auditNames()
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ events: events.map((e) => ({ ...e, ...eventAction(e, names) })), next: events.length ? events.at(-1)!.id : null }))
       return
     }
     // Checks the log's hash chain, every event in order.
@@ -6432,7 +6465,7 @@ const server = createServer(async (req, res) => {
         before = page.at(-1)!.id
       }
       const name = `audit-${new Date().toISOString().slice(0, 10)}.csv`
-      res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store', 'content-disposition': `attachment; filename="${name}"` }).end('\ufeff' + eventsCsv(events))
+      res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store', 'content-disposition': `attachment; filename="${name}"` }).end('\ufeff' + eventsCsv(events, auditNames()))
       return
     }
     // Every case kept, searched (the Audit page's Cases).
