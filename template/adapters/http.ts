@@ -350,7 +350,6 @@ import {
   type WorkflowAgentInfo,
   type WorkflowAppStatus,
   type WorkflowMcpDeps,
-  workflowPageHtml,
   goalsPageAs,
   inboxPageHtml,
   renderInboxOnlyPage,
@@ -6337,9 +6336,12 @@ const server = createServer(async (req, res) => {
       await handleInterviews(req, res, pathname)
       return
     }
-    // "Describe a workflow": the page, and its routes.
+    // "Describe a workflow" is the New workflow dialog on the Workflows
+    // page now: /workflows/new forwards there, with what it was given (an
+    // agent, a description, a goal's suggestion).
     if (req.method === 'GET' && pathname === '/workflows/new') {
-      res.writeHead(200, { 'content-type': 'text/html' }).end(workflowPageHtml)
+      const query = (req.url ?? '').split('?')[1]
+      res.writeHead(302, { location: '/workflows?new=1' + (query ? '&' + query : '') }).end()
       return
     }
     // Success criteria for a plan that came without them (a ready-made
@@ -6473,9 +6475,9 @@ const server = createServer(async (req, res) => {
       await handleAgentWorkflows(req, res, decodeURIComponent(agentWorkflowsMatch[1]), agentWorkflowsMatch[2], agentWorkflowsMatch[3], agentWorkflowsMatch[4] ? Number(agentWorkflowsMatch[4]) : undefined)
       return
     }
-    // Templates are now workflow examples, on the new-workflow page.
+    // Templates are now workflow examples, on the Workflows page.
     if (req.method === 'GET' && pathname === '/templates') {
-      res.writeHead(302, { location: '/workflows/new#examples' }).end()
+      res.writeHead(302, { location: '/workflows?view=examples' }).end()
       return
     }
     const editAgentMatch = req.method === 'PUT' && pathname.match(/^\/agents\/([^/]+)$/)
